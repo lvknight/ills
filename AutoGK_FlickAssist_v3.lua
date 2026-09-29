@@ -204,6 +204,13 @@ end
 -- CONFIGURATION
 --==============================================================
 
+local SafeConfig = {
+    -- Conservative goalkeeper defaults: only lateral dives and no backward recovery.
+    DiveFilter = "SIDES",
+    BackwardRecovery = false,
+    UIStartHidden = true,
+}
+
 local Config = {
     Enabled = true,
     PositionAssist = true,
@@ -220,8 +227,8 @@ local Config = {
     RespectManualMovement = true,
     HighBallJumps = true,
     JumpThenDive = true,
-    DiveFilter = "SMART",
-    BackwardRecovery = true,
+    DiveFilter = SafeConfig.DiveFilter,
+    BackwardRecovery = SafeConfig.BackwardRecovery,
     PlannerHz = 12,
     CloseShotPlannerHz = 30,
     UISampleHz = 4,
@@ -263,6 +270,7 @@ local Stats = {
 }
 
 ENV.AutoGKConfig = Config
+ENV.AutoGKSafeConfig = SafeConfig
 ENV.AutoGKStats = Stats
 ENV.AUTO_GK_ENABLED = true
 ENV.AutoGKBuild = BUILD
@@ -1770,7 +1778,7 @@ local function allowedDirections(f)
     elseif filter == "RIGHT" then
         result = { "R", "RF" }
     elseif filter == "SIDES" then
-        result = { "L", "R" }
+        result = { "L", "R", "LF", "RF" }
     else
         result = { "F", "L", "R", "LF", "RF" }
     end
@@ -5612,6 +5620,25 @@ local function createStriker(d)
         if x < -threshold then return -1 end
         return 0
     end
+
+    -- Flick targets should not merely cross the goal center. Prefer the far
+    -- post/corner of the selected side, while still letting rate() reject it
+    -- if the route is actually unsafe. This makes the flick finish farther
+    -- from the keeper's reachable envelope instead of stopping near the middle.
+    local function flickEdgeScore(f, candidate, flickSide)
+        if not f or not candidate or not candidate.rating or not vec(candidate.rating.position)
+            or flickSide == 0 then return -math.huge end
+        local offset = candidate.rating.position - f.mouth.center
+        local x = offset:Dot(f.mouth.lateral)
+        local y = offset:Dot(f.mouth.up)
+        local half = math.max(f.mouth.halfWidth, 0.01)
+        local height = math.max(f.mouth.top - f.mouth.bottom, 0.01)
+        local sideAmount = math.clamp((x * flickSide) / half, -1, 1)
+        local heightAmount = math.clamp((y - f.mouth.bottom) / height, 0, 1)
+        -- Side distance is the main goal; a modest high-corner bonus helps
+        -- avoid selecting a reachable mid-height point when the corner exists.
+        return sideAmount * 2.0 + heightAmount * 0.35
+    end
     local function searchTargets(f)
         local mouth = f.mouth
         -- Leave room for the iterative solver's 0.30-stud target tolerance.
@@ -5908,6 +5935,13 @@ local function createStriker(d)
                 local as = candidateSide(f, a) == flickSide
                 local bs = candidateSide(f, b) == flickSide
                 if as ~= bs then return as end
+                if as and bs then
+                    -- For a flick, edge/corner placement outranks a merely opposite-side
+                    -- point. Physics validation below still has the final say.
+                    local ae = flickEdgeScore(f, a, flickSide)
+                    local be = flickEdgeScore(f, b, flickSide)
+                    if math.abs(ae - be) > 0.08 then return ae > be end
+                end
             end
             -- Revalidate the previous winner, then fairly visit alternatives. Two stale
             -- top-ranked proposals must not hide every other lane until aim lock.
@@ -7734,6 +7768,86 @@ EVALUATION.ConfigureComparison(MISC.ObserveDribbleGate, function()
         autoDribble = MISC.AutoDribble, infiniteStamina = MISC.InfiniteStamina }
 end)
 ENV.DmcMisc = MISC
+
+--==============================================================
+-- PERSISTENT CONFIG
+--==============================================================
+local CONFIG_FILE = "AutoGK_Config.json"
+local function saveConfig()
+    if type(writefile) ~= "function" then
+        return false, "writefile unavailable"
+    end
+    local HttpService = game:GetService("HttpService")
+    local data = {
+        version = 1,
+        config = {},
+        striker = {
+            enabled = STR.Enabled,
+            autoCurve = STR.AutoCurve,
+            smartRelease = STR.SmartRelease,
+            flickAssist = STR.FlickAssist,
+            flickSmoothness = STR.FlickSmoothness,
+        },
+        misc = {
+            autoDribble = MISC.AutoDribble,
+            infiniteStamina = MISC.InfiniteStamina,
+        },
+    }
+    for key, value in pairs(Config) do
+        local valueType = typeof(value)
+        if key ~= "DiveFilter" and key ~= "BackwardRecovery"
+                and valueType ~= "nil" and (valueType == "boolean" or valueType == "number" or valueType == "string") then
+            data.config[key] = value
+        end
+    end
+    local ok, encoded = pcall(HttpService.JSONEncode, HttpService, data)
+    if not ok then return false, encoded end
+    local wrote, err = pcall(writefile, CONFIG_FILE, encoded)
+    if not wrote then return false, err end
+    return true, "saved"
+end
+
+local function loadConfig()
+    if type(isfile) ~= "function" or type(readfile) ~= "function" or not isfile(CONFIG_FILE) then
+        return false, "no saved config"
+    end
+    local HttpService = game:GetService("HttpService")
+    local ok, raw = pcall(readfile, CONFIG_FILE)
+    if not ok then return false, raw end
+    local decodedOk, data = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not decodedOk or type(data) ~= "table" then return false, "invalid config" end
+
+    if type(data.config) == "table" then
+        for key, value in pairs(data.config) do
+            if key ~= "DiveFilter" and key ~= "BackwardRecovery"
+                and Config[key] ~= nil
+                and (typeof(value) == "boolean" or typeof(value) == "number" or typeof(value) == "string") then
+                Config[key] = value
+            end
+        end
+    end
+
+    local st = data.striker
+    if type(st) == "table" then
+        if st.enabled ~= nil then STR.SetEnabled(st.enabled == true) end
+        if st.autoCurve ~= nil then STR.SetAutoCurve(st.autoCurve == true) end
+        if st.smartRelease ~= nil then STR.SetSmartRelease(st.smartRelease == true) end
+        if st.flickAssist ~= nil then STR.SetFlickAssist(st.flickAssist == true) end
+        if st.flickSmoothness ~= nil then STR.SetFlickSmoothness(st.flickSmoothness) end
+    end
+
+    local mi = data.misc
+    if type(mi) == "table" then
+        if mi.autoDribble ~= nil then MISC.SetAutoDribble(mi.autoDribble == true) end
+        if mi.infiniteStamina ~= nil then MISC.SetInfiniteStamina(mi.infiniteStamina == true) end
+    end
+    return true, "loaded"
+end
+
+ENV.AutoGKSaveConfig = saveConfig
+ENV.AutoGKLoadConfig = loadConfig
+loadConfig()
+
 ENV.DmcMiscDebug = function()
     local result = MISC.Debug()
     print("[Dmc Misc]", game:GetService("HttpService"):JSONEncode(result))
@@ -7833,7 +7947,7 @@ do
     end
 
     local Gui = create("ScreenGui", {
-        Name = "AutoGKInterface", ResetOnSpawn = false, Enabled = true,
+        Name = "AutoGKInterface", ResetOnSpawn = false, Enabled = not SafeConfig.UIStartHidden,
         IgnoreGuiInset = true, DisplayOrder = 20,
         ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
     }, PlayerGui)
@@ -8385,13 +8499,13 @@ do
     slider("Flick Smoothness", function() return STR.FlickSmoothness end, STR.SetFlickSmoothness, 1, 10)
     toggle("Auto curve ball", function() return STR.AutoCurve end, STR.SetAutoCurve)
     toggle("Smart shot release", function() return STR.SmartRelease end, STR.SetSmartRelease)
-    local miscellaneousSection = frame(strikerContent, "Miscellaneous", 0, 198, 292, 89)
+    local miscellaneousSection = frame(strikerContent, "Miscellaneous", 0, 198, 292, 125)
     miscellaneousSection.BackgroundTransparency = 1
     text(miscellaneousSection, "MISCELLANEOUS", 9, {
         Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(292, 16),
         Font = Enum.Font.GothamMedium, TextColor3 = C.accentDim,
     })
-    activeBody = frame(miscellaneousSection, "Options", 0, 22, 292, 67)
+    activeBody = frame(miscellaneousSection, "Options", 0, 22, 292, 103)
     activeBody.BackgroundTransparency = 1
     create("UIListLayout", {
         Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder,
@@ -8399,22 +8513,36 @@ do
     order = 0
     toggle("Auto dribble", function() return MISC.AutoDribble end, MISC.SetAutoDribble)
     toggle("Infinite stamina", function() return MISC.InfiniteStamina end, MISC.SetInfiniteStamina)
+    order = order + 1
+    local saveButton = button(activeBody, {
+        Name = "SaveConfig", Text = "SAVE CONFIG", TextSize = 10,
+        Size = UDim2.new(1, 0, 0, 28), LayoutOrder = order,
+    })
+    hover(saveButton)
+    connect(saveButton.Activated, function()
+        if not S.alive then return end
+        local ok, detail = saveConfig()
+        saveButton.Text = ok and "SAVED" or "SAVE FAILED"
+        task.delay(0.8, function()
+            if saveButton and saveButton.Parent then saveButton.Text = "SAVE CONFIG" end
+        end)
+    end)
     local strikerStatus = text(strikerContent, "OFF", 11, {
-        Name = "StrikerStatus", Position = UDim2.fromOffset(8, 279),
+        Name = "StrikerStatus", Position = UDim2.fromOffset(8, 315),
         Size = UDim2.fromOffset(276, 30), TextWrapped = true,
         Font = Enum.Font.GothamMedium, TextColor3 = C.accent,
     })
     local strikerDetail = text(strikerContent, "", 10, {
-        Name = "StrikerDetail", Position = UDim2.fromOffset(8, 313),
+        Name = "StrikerDetail", Position = UDim2.fromOffset(8, 349),
         Size = UDim2.fromOffset(276, 54), TextWrapped = true,
         TextColor3 = C.muted,
     })
     local miscellaneousStatus = text(strikerContent, "", 9, {
-        Name = "MiscStatus", Position = UDim2.fromOffset(8, 370), Size = UDim2.fromOffset(276, 28),
+        Name = "MiscStatus", Position = UDim2.fromOffset(8, 406), Size = UDim2.fromOffset(276, 28),
         TextWrapped = true, TextColor3 = C.accentDim,
     })
     text(strikerContent, "Shots: within 55 studs. Hold for smart release.\nDribble: nearby opponents within 9 studs.", 10, {
-        Position = UDim2.fromOffset(8, 403), Size = UDim2.fromOffset(276, 32),
+        Position = UDim2.fromOffset(8, 439), Size = UDim2.fromOffset(276, 32),
         TextWrapped = true, TextColor3 = C.muted,
     })
 
@@ -8771,9 +8899,14 @@ ENV.AutoGKDebug = function()
             )
         end
     end
+
+    -- Start hidden; RightShift still toggles the UI open/closed.
+    if SafeConfig.UIStartHidden then
+        Gui.Enabled = false
+    end
 end
 
-print("[Auto GK] Loaded | RightShift: show / hide")
+print("[Auto GK] Loaded | RightShift: show / hide | UI starts hidden")
 
--- DMC MAIN END
+-- BANYU 
 end)
