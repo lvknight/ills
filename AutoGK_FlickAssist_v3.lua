@@ -6,7 +6,7 @@ local function createDmcStartup(d)
     }
     function B.Status(text)
         B.stage = text
-        if not B.finished then pcall(d.show, "Dmc | Starting", text) end
+        if not B.finished then pcall(d.show, "Banyu | Starting", text) end
     end
     function B.Load(path)
         B.Status("Loading " .. path)
@@ -130,7 +130,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-local BUILD = "Auto GK 3.2.7 | STR 0.17 | Misc 0.7 | Evaluation 0.2"
+local BUILD = "Auto GK 3.2.8 | STR 0.17 | Misc 0.7 | Evaluation 0.2"
 local ENV = _G
 if type(getgenv) == "function" then
     local ok, environment = pcall(getgenv)
@@ -4679,7 +4679,8 @@ local function createStriker(d)
         MaxAssistDistance = 55, ClearGapThreshold = 0.75, VolleyPrepareSeconds = 0.30,
         ReleaseInterval = 0.05, ReleaseMargin = 0.35, ReleaseBudgetMs = 2.5,
         FlickTriggerCharge = 0.80, FlickCenterThreshold = 0.22, FlickKeeperDeadzone = 0.70,
-        FlickMaxChecks = 5, FlickEdgeInset = 0.94, FlickFallbackInset = 0.82 }
+        FlickMaxChecks = 5, FlickEdgeInset = 0.94, FlickFallbackInset = 0.82,
+        BestShotMaxChecks = 6 }
     local stats = { shots = 0, assisted = 0, redirected = 0, flicks = 0, confirmed = 0, rejected = 0, candidates = 0, evaluations = 0,
         errors = 0, maxSliceMs = 0, maxAimMs = 0, lastCharge = 0, lastCurve = 0,
         releaseChecks = 0, releaseBudgetSkips = 0, releaseRequests = 0, autoReleases = 0, maxReleaseMs = 0 }
@@ -5939,14 +5940,16 @@ local function createStriker(d)
                 owner.validationStage = stage
                 -- Native curve strength changes with charge. Revisit the strongest
                 -- full-power proposals when entering the lock/volley window, then
-                -- continue the existing fair rotation with the same two-check limit.
+                -- validate several independent lanes so Best Shot Assist cannot get
+                -- stuck on the original aim merely because the first two proposals
+                -- were stale, blocked, or from the same side.
                 for _, entry in ipairs(owner.candidates) do entry.checkedAt = nil end
             end
         end
         -- Recheck a completed candidate using current power, launch position and keeper state.
         -- Invalid/stale work never supplies a direction to native shooting.
         local checked, seenAims = 0, {}
-        local maxChecks = owner.flickActive and math.max(3, C.FlickMaxChecks) or 2
+        local maxChecks = owner.flickActive and math.max(3, C.FlickMaxChecks) or math.max(4, C.BestShotMaxChecks or 6)
         local shortlist = table.clone(owner.candidates)
         -- Preserve the chosen route even if the bounded search pool evicts its seed.
         -- It is a proposal only: revalidate it below with current power/world/keeper data.
@@ -5967,8 +5970,9 @@ local function createStriker(d)
                     if math.abs(ae - be) > 0.08 then return ae > be end
                 end
             end
-            -- Revalidate the previous winner, then fairly visit alternatives. Two stale
-            -- top-ranked proposals must not hide every other lane until aim lock.
+            -- Revalidate the previous winner, then fairly visit alternatives. A bounded
+            -- multi-lane pass prevents two stale top-ranked proposals from hiding
+            -- every other lane until aim lock.
             local incumbent = choice and choice.candidate or owner.selectedCandidate
             if a == incumbent then return b ~= incumbent end
             if b == incumbent then return false end
@@ -5988,6 +5992,30 @@ local function createStriker(d)
             if math.abs(ad - bd) > 1e-5 then return ad < bd end
             return betterRating(a.rating, b.rating)
         end)
+        -- After ranking, deliberately pull one fresh representative from each
+        -- horizontal lane into the front of the bounded validation pass. This is
+        -- what prevents a strong-looking left candidate from consuming every
+        -- validation slot while the right side is never physically checked.
+        if flickSide == 0 and #shortlist > 1 then
+            local lanes, laneSeen = {}, {}
+            local function laneOf(entry)
+                local side = candidateSide(f, entry)
+                return side == 0 and 0 or side
+            end
+            for _, preferredLane in ipairs({ -1, 1, 0 }) do
+                for _, entry in ipairs(shortlist) do
+                    if not laneSeen[entry] and laneOf(entry) == preferredLane then
+                        lanes[#lanes + 1] = entry
+                        laneSeen[entry] = true
+                        break
+                    end
+                end
+            end
+            for _, entry in ipairs(shortlist) do
+                if not laneSeen[entry] then lanes[#lanes + 1] = entry end
+            end
+            shortlist = lanes
+        end
         for _, entry in ipairs(shortlist) do
             local wantedLane = flickSide == 0 or candidateSide(f, entry) == flickSide
             if wantedLane and (requiredCurve == nil or entry.curve == requiredCurve)
@@ -8458,7 +8486,7 @@ do
             { value = "FORWARD", label = "Forward" },
             { value = "LEFT", label = "Left" },
             { value = "RIGHT", label = "Right" },
-            { value = "SIDES", label = "Sides" },
+            { value = "SIDES", label = "SafeAuto" },
         },
 
         function()
@@ -8975,5 +9003,5 @@ end
 
 print("[Auto GK] Loaded | RightShift: show / hide | UI starts hidden")
 
--- BANYU MAIN END
+-- DMC MAIN END
 end)
