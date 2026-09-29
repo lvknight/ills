@@ -1770,7 +1770,7 @@ local function allowedDirections(f)
     elseif filter == "RIGHT" then
         result = { "R", "RF" }
     elseif filter == "SIDES" then
-        result = { "L", "R", "LF", "RF" }
+        result = { "L", "R" }
     else
         result = { "F", "L", "R", "LF", "RF" }
     end
