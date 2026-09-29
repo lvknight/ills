@@ -39,7 +39,7 @@ local function createDmcStartup(d)
             end
             B.error = message
             d.warn("[Dmc startup] " .. message)
-            pcall(d.show, "Dmc | Startup failed", message .. "\n\nSend this error and your executor name when reporting the problem.")
+            pcall(d.show, "Banyu | Startup failed", message .. "\n\nSend this error and your executor name when reporting the problem.")
         end
         return ok, err
     end
@@ -99,26 +99,26 @@ local BOOT = createDmcStartup({
         local players = game:GetService("Players")
         local deadline = os.clock() + 30
         while (not game:IsLoaded() or not players.LocalPlayer) and os.clock() < deadline do
-            startupShow("Dmc | Starting", "Waiting for the game to finish loading...")
+            startupShow("Banyu | Starting", "Waiting for the game to finish loading...")
             task.wait(0.1)
         end
-        assert(game:IsLoaded() and players.LocalPlayer, "Game client was not ready after 30 seconds. Join the game before running Dmc.")
+        assert(game:IsLoaded() and players.LocalPlayer, "Game client was not ready after 30 seconds. Join the game before running Banyu.")
         assert(players.LocalPlayer:WaitForChild("PlayerGui", 30), "PlayerGui is unavailable.")
-        startupShow("Dmc | Starting", "Loading game modules...")
+        startupShow("Banyu | Starting", "Loading game modules...")
     end,
     resolve = function(path)
         local object = game:GetService("ReplicatedStorage")
         local deadline = os.clock() + 30
         for name in string.gmatch(path, "[^.]+") do
             object = object:WaitForChild(name, math.max(0.01, deadline - os.clock()))
-            assert(object, "Missing dependency: " .. path .. ". Run Dmc in the supported game after it loads.")
+            assert(object, "Missing dependency: " .. path .. ". Run Banyu in the supported game after it loads.")
         end
         return object
     end,
 })
 
 BOOT.Run(function()
--- DMC MAIN BEGIN
+-- BANYU MAIN BEGIN
 --==============================================================
 -- SERVICES
 --==============================================================
@@ -130,7 +130,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-local BUILD = "Auto GK 3.2.8 | STR 0.17 | Misc 0.7 | Evaluation 0.2"
+local BUILD = "Auto GK 3.2.9 | STR 0.17 | Misc 0.7 | Evaluation 0.2"
 local ENV = _G
 if type(getgenv) == "function" then
     local ok, environment = pcall(getgenv)
@@ -1778,7 +1778,7 @@ local function allowedDirections(f)
     elseif filter == "RIGHT" then
         result = { "R", "RF" }
     elseif filter == "SIDES" then
-        result = { "L", "R", "F" }
+        result = { "L", "R" }
     else
         result = { "F", "L", "R", "LF", "RF" }
     end
@@ -6688,6 +6688,7 @@ local function createStrikerMisc(d)
     local placementHook = nil
     local nextStaminaRetry = 0
     local nextTick, nextDiscovery, manualUntil, retryAt = 0, 0, 0, 0
+    local slideRecoveryUntil = 0
     local candidates, cachedCharacter = {}, nil
     local staminaSource = "DmcStamina_" .. d.id
     local staminaOwned = false
@@ -6698,7 +6699,7 @@ local function createStrikerMisc(d)
     local recent = {}
     local lastCorrection = nil
     local C = { Interval = 1 / 60, DiscoverySeconds = 0.08, Range = 45, Lookahead = 0.30, KickLookahead = 0.18,
-        RetrySeconds = 0.18, Step = 0.015, Padding = 1.2, ManualGrace = 0.18 }
+        RetrySeconds = 0.18, Step = 0.015, Padding = 1.2, ManualGrace = 0.18, SlideRecovery = 0.12 }
     local function flat(v) return Vector3.new(v.X, 0, v.Z) end
     local function finite(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
     local function vector(v) return typeof(v) == "Vector3" and finite(v.X) and finite(v.Y) and finite(v.Z) end
@@ -6935,7 +6936,24 @@ local function createStrikerMisc(d)
             if N.Controls.IsActive(name) then return nil, "STRIKING" end
         end
         if d.M.Dodge.IsDribbling() then return nil, "DRIBBLING" end
-        if d.M.Slide.IsSlideTackling() or not d.M.Controllers.IsLanded(ch, hum) then return nil, "MOVING" end
+        local slidingNow = d.M.Slide.IsSlideTackling()
+        if slidingNow then
+            slideRecoveryUntil = math.max(slideRecoveryUntil, os.clock() + C.SlideRecovery)
+            return nil, "SLIDING"
+        end
+        -- Slide animations can keep the native controller in MOVING briefly after
+        -- the tackle state has ended. Give the character a short recovery window,
+        -- then accept either the native landed flag or a grounded Humanoid state.
+        if os.clock() < slideRecoveryUntil then return nil, "SLIDE RECOVERY" end
+        local landed = d.M.Controllers.IsLanded(ch, hum)
+        if not landed then
+            local state = hum:GetState()
+            landed = state ~= Enum.HumanoidStateType.Freefall
+                and state ~= Enum.HumanoidStateType.Jumping
+                and state ~= Enum.HumanoidStateType.FallingDown
+                and state ~= Enum.HumanoidStateType.Ragdoll
+        end
+        if not landed then return nil, "MOVING" end
         if not N.Controls.IsAvailable("Dribble") or N.Controls.IsOnCooldown("Dribble") then return nil, "COOLDOWN / BLOCKED" end
         if not N.Sprint.CanSpendStamina(N.Dodge.Constants.StaminaCost, true) then return nil, "LOW STAMINA" end
         if os.clock() < retryAt then return nil, "RETRY WAIT" end
@@ -9003,5 +9021,5 @@ end
 
 print("[Auto GK] Loaded | RightShift: show / hide | UI starts hidden")
 
--- DMC MAIN END
+-- BANYU MAIN END
 end)
