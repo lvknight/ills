@@ -130,7 +130,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-local BUILD = "Auto GK 3.2.6 | STR 0.16 | Misc 0.6 | Evaluation 0.2"
+local BUILD = "Auto GK 3.2.7 | STR 0.17 | Misc 0.7 | Evaluation 0.2"
 local ENV = _G
 if type(getgenv) == "function" then
     local ok, environment = pcall(getgenv)
@@ -1778,7 +1778,7 @@ local function allowedDirections(f)
     elseif filter == "RIGHT" then
         result = { "R", "RF" }
     elseif filter == "SIDES" then
-        result = { "L", "R" }
+        result = { "L", "R", "F" }
     else
         result = { "F", "L", "R", "LF", "RF" }
     end
@@ -4678,7 +4678,8 @@ local function createStriker(d)
         SampleHz = 30, CandidateAge = 0.35, NetworkMargin = 0.10, EdgeMargin = 0.65, TargetSlack = 0.35,
         MaxAssistDistance = 55, ClearGapThreshold = 0.75, VolleyPrepareSeconds = 0.30,
         ReleaseInterval = 0.05, ReleaseMargin = 0.35, ReleaseBudgetMs = 2.5,
-        FlickTriggerCharge = 0.80, FlickCenterThreshold = 0.22, FlickKeeperDeadzone = 0.70 }
+        FlickTriggerCharge = 0.80, FlickCenterThreshold = 0.22, FlickKeeperDeadzone = 0.70,
+        FlickMaxChecks = 5, FlickEdgeInset = 0.94, FlickFallbackInset = 0.82 }
     local stats = { shots = 0, assisted = 0, redirected = 0, flicks = 0, confirmed = 0, rejected = 0, candidates = 0, evaluations = 0,
         errors = 0, maxSliceMs = 0, maxAimMs = 0, lastCharge = 0, lastCurve = 0,
         releaseChecks = 0, releaseBudgetSkips = 0, releaseRequests = 0, autoReleases = 0, maxReleaseMs = 0 }
@@ -5621,6 +5622,27 @@ local function createStriker(d)
         return 0
     end
 
+    -- Build a fresh aim directly on the requested flick lane. This is the
+    -- anti-stuck path: if cached candidates do not contain the opposite side,
+    -- we generate a few fresh edge targets instead of returning the original aim.
+    local function directFlickAim(f, flickSide, xInset, yRatio)
+        if not f or flickSide == 0 or not f.mouth then return nil end
+        local inset = f.radius + C.EdgeMargin + C.TargetSlack
+        local half = f.mouth.halfWidth - inset
+        local low = f.mouth.bottom + f.radius + 0.4
+        local high = f.mouth.top - inset
+        if half <= 0 or high <= low then return nil end
+        local x = half * math.clamp(xInset or C.FlickEdgeInset, 0.55, 0.98) * flickSide
+        local y = low + (high - low) * math.clamp(yRatio or 0.72, 0.20, 0.90)
+        local center = f.mouth.center + f.mouth.lateral * x
+        local point = Vector3.new(center.X, y, center.Z)
+        local origin = f.sample.Origin + (f.aimOffset or V0)
+        local direction = point - origin
+        if not vec(direction) or direction.Magnitude < 1e-5 then return nil end
+        local yaw, pitch = angles(direction.Unit)
+        return aimAt(f, yaw, pitch), point
+    end
+
     -- Flick targets should not merely cross the goal center. Prefer the far
     -- post/corner of the selected side, while still letting rate() reject it
     -- if the route is actually unsafe. This makes the flick finish farther
@@ -5854,6 +5876,7 @@ local function createStriker(d)
         owner.flicked = false
         owner.flickSide = 0
         owner.flickAlpha = 0
+        owner.flickDirect = false
         owner.decisionAudit = nil
         owner.completedAlternatives, owner.checkedAlternatives = 0, 0
         local f = frame(sample)
@@ -5923,6 +5946,7 @@ local function createStriker(d)
         -- Recheck a completed candidate using current power, launch position and keeper state.
         -- Invalid/stale work never supplies a direction to native shooting.
         local checked, seenAims = 0, {}
+        local maxChecks = owner.flickActive and math.max(3, C.FlickMaxChecks) or 2
         local shortlist = table.clone(owner.candidates)
         -- Preserve the chosen route even if the bounded search pool evicts its seed.
         -- It is a proposal only: revalidate it below with current power/world/keeper data.
@@ -5997,7 +6021,7 @@ local function createStriker(d)
                     checkedAt = entry.checkedAt }
                 local rating, edgePosition = rate(candidateFrame, aim, false)
                 local correctedEdge = false
-                if not rating and edgePosition and checked < 2 then
+                if not rating and edgePosition and checked < maxChecks then
                     local corrected = insetAim(candidateFrame, aim, edgePosition)
                     if corrected then
                         checked += 1
@@ -6021,7 +6045,7 @@ local function createStriker(d)
                 if betterRating(rating, best) then
                     chosen, best, selectedCandidate, selectedCurve = aim, rating, entry, candidateFrame.curve
                 end
-                if checked >= 2 then break end
+                if checked >= maxChecks then break end
             end
         end
         -- A valid current aim is also a candidate, including while alternatives are still solving.
@@ -6033,9 +6057,44 @@ local function createStriker(d)
         -- solution with the user's original direction. Only fall back when the
         -- requested side has no valid candidate at all.
         if owner.flickActive and not chosen then
-            owner.flickFallback = true
-            if normal and (requiredCurve == nil or f.curve == requiredCurve) then
-                chosen, best, selectedCandidate, selectedCurve = table.clone(sample), normal, nil, f.curve
+            -- Cached candidates can all be stale or belong to the original lane.
+            -- Generate fresh opposite-side edge shots now, and validate each one.
+            -- This is deliberately bounded so the release path stays responsive.
+            local fallbackTargets = {
+                { inset = C.FlickEdgeInset, y = 0.72 },
+                { inset = C.FlickFallbackInset, y = 0.58 },
+                { inset = 0.68, y = 0.78 },
+                { inset = 0.78, y = 0.38 },
+            }
+            for _, targetSpec in ipairs(fallbackTargets) do
+                if not chosen then
+                    local aim = directFlickAim(f, flickSide, targetSpec.inset, targetSpec.y)
+                    if aim then
+                        local candidateFrame = f
+                        if f.autoCurve and requiredCurve ~= nil then
+                            candidateFrame = table.clone(f)
+                            candidateFrame.curve = requiredCurve
+                        end
+                        local rating = rate(candidateFrame, aim, false)
+                        owner.validationSequence = (owner.validationSequence or 0) + 1
+                        audit.checked[#audit.checked + 1] = { valid = rating ~= nil, directFlick = true,
+                            score = rating and rating.score, defenderRisk = rating and rating.defenderRisk,
+                            gap = rating and rating.gap, flightSeconds = rating and rating.eta }
+                        if rating then
+                            chosen, best, selectedCandidate, selectedCurve = aim, rating, nil, candidateFrame.curve
+                            owner.flickDirect = true
+                            break
+                        end
+                    end
+                end
+            end
+            if not chosen then
+                owner.flickFallback = true
+                if normal and (requiredCurve == nil or f.curve == requiredCurve) then
+                    chosen, best, selectedCandidate, selectedCurve = table.clone(sample), normal, nil, f.curve
+                end
+            else
+                owner.flickFallback = false
             end
         else
             owner.flickFallback = false
@@ -6610,8 +6669,8 @@ local function createStrikerMisc(d)
         observerErrors = 0, errors = 0, maxTickMs = 0 }
     local recent = {}
     local lastCorrection = nil
-    local C = { Interval = 1 / 30, DiscoverySeconds = 0.15, Range = 40, Lookahead = 0.22, KickLookahead = 0.12,
-        RetrySeconds = 0.25, Step = 0.025, Padding = 1.0, ManualGrace = 0.15 }
+    local C = { Interval = 1 / 60, DiscoverySeconds = 0.08, Range = 45, Lookahead = 0.30, KickLookahead = 0.18,
+        RetrySeconds = 0.18, Step = 0.015, Padding = 1.2, ManualGrace = 0.18 }
     local function flat(v) return Vector3.new(v.X, 0, v.Z) end
     local function finite(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
     local function vector(v) return typeof(v) == "Vector3" and finite(v.X) and finite(v.Y) and finite(v.Z) end
@@ -6996,8 +7055,16 @@ local function createStrikerMisc(d)
                     local otherVelocity = d.M.Motion.GetVelocity(other) or otherRoot.AssemblyLinearVelocity
                     if vector(otherCF.Position) and vector(otherVelocity)
                         and (otherCF.Position - ownCF.Position).Magnitude <= C.Range then
+                        local relative = flat(ownCF.Position - otherCF.Position)
+                        local relativeVelocity = flat(velocity - otherVelocity)
+                        local closingSpeed = relative.Magnitude > 1e-4
+                            and relativeVelocity:Dot(relative.Unit) or 0
                         local eta = sliding and contactTime(ownCF, velocity, otherCF, otherVelocity, age) or nil
                         local kickEta = kick and kickContactTime(ownCF, velocity, otherCF, otherVelocity, kick.first) or nil
+                        -- A moving attacker can cross the tackle box faster than a static-distance
+                        -- check suggests. Keep the native hitbox result authoritative, but use
+                        -- relative motion to discard obviously receding contacts.
+                        if closingSpeed < -8 and not sliding then kickEta = nil end
                         local reason = "tackle"
                         if kickEta and (not eta or kickEta < eta) then eta, reason = kickEta, "kick" end
                         local distance = flat(otherCF.Position - ownCF.Position).Magnitude
@@ -8908,5 +8975,5 @@ end
 
 print("[Auto GK] Loaded | RightShift: show / hide | UI starts hidden")
 
--- BANYU 
+-- BANYU MAIN END
 end)
