@@ -8070,7 +8070,7 @@ local function toggleFeatureByKey(name)
     end
 end
 
-local keybindConnection = UserInputService.InputBegan:Connect(function(input, processed)
+local keybindConnection = connect(UserInputService.InputBegan, function(input, processed)
     if not S.alive then return end
     if keybindCapture then
         if input.UserInputType == Enum.UserInputType.Keyboard
@@ -8094,7 +8094,6 @@ local keybindConnection = UserInputService.InputBegan:Connect(function(input, pr
         end
     end
 end)
-connections[#connections + 1] = keybindConnection
 ENV.AutoGKKeybinds = FeatureKeybinds
 EVALUATION.ConfigureComparison(MISC.ObserveDribbleGate, function()
     return { bestShot = STR.Enabled, autoCurve = STR.AutoCurve, smartRelease = STR.SmartRelease,
