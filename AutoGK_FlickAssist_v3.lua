@@ -130,7 +130,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-local BUILD = "Auto GK 3.2.9 | STR 0.17 | Misc 0.7 | Evaluation 0.2"
+local BUILD = "Auto GK 3.2.10 | STR 0.17 | Misc 0.7 | Evaluation 0.2"
 local ENV = _G
 if type(getgenv) == "function" then
     local ok, environment = pcall(getgenv)
@@ -4680,7 +4680,7 @@ local function createStriker(d)
         ReleaseInterval = 0.05, ReleaseMargin = 0.35, ReleaseBudgetMs = 2.5,
         FlickTriggerCharge = 0.80, FlickCenterThreshold = 0.22, FlickKeeperDeadzone = 0.70,
         FlickMaxChecks = 5, FlickEdgeInset = 0.94, FlickFallbackInset = 0.82,
-        BestShotMaxChecks = 6 }
+        BestShotMaxChecks = 12 }
     local stats = { shots = 0, assisted = 0, redirected = 0, flicks = 0, confirmed = 0, rejected = 0, candidates = 0, evaluations = 0,
         errors = 0, maxSliceMs = 0, maxAimMs = 0, lastCharge = 0, lastCurve = 0,
         releaseChecks = 0, releaseBudgetSkips = 0, releaseRequests = 0, autoReleases = 0, maxReleaseMs = 0 }
@@ -5525,6 +5525,70 @@ local function createStriker(d)
         local point = mouth.center + mouth.lateral * target.X
         return Vector3.new(point.X, target.Y, point.Z)
     end
+    -- Best Shot Assist: hard far-side policy. A target is only eligible when it
+    -- is clearly on the side opposite the goalkeeper; center/keeper-head targets
+    -- are never used as a fallback.
+    local function preferredShotSide(f)
+        if not f or not f.mouth or not f.keepers or #f.keepers == 0 then return 0 end
+        local weighted, total = 0, 0
+        for _, keeper in ipairs(f.keepers) do
+            local x = (keeper.position - f.mouth.center):Dot(f.mouth.lateral)
+            local weight = 1 / math.max(2, flat(keeper.position - f.mouth.center).Magnitude)
+            weighted += x * weight
+            total += weight
+        end
+        local bias = total > 0 and weighted / total or 0
+        local deadzone = f.mouth.halfWidth * 0.12
+        if bias > deadzone then return -1 end
+        if bias < -deadzone then return 1 end
+
+        -- Centered keeper: compare modeled reach at the two far-side points.
+        local inset = f.radius + C.EdgeMargin + C.TargetSlack
+        local half = math.max(0, f.mouth.halfWidth - inset)
+        local low = f.mouth.bottom + f.radius + 0.4
+        local high = f.mouth.top - inset
+        if half > 0 and high > low then
+            local y = low + (high - low) * 0.55
+            local left = targetPoint(f.mouth, Vector2.new(half * 0.72, y))
+            local right = targetPoint(f.mouth, Vector2.new(-half * 0.72, y))
+            local speed = (N.Shoot.Constants.Shot and N.Shoot.Constants.Shot.MaximumSpeed) or 123
+            local _, ld = reachDemand(f, left, left, (left - f.origin).Magnitude / math.max(speed, 1))
+            local _, rd = reachDemand(f, right, right, (right - f.origin).Magnitude / math.max(speed, 1))
+            if ld and rd and math.abs(ld - rd) > 0.03 then
+                return ld > rd and 1 or -1
+            end
+        end
+        return 1
+    end
+
+    local function bestShotTargetAllowed(f, rating, side)
+        if not f or not rating or not vec(rating.position) or side == 0 then return false end
+        local half = math.max(f.mouth.halfWidth, 0.01)
+        local x = (rating.position - f.mouth.center):Dot(f.mouth.lateral)
+        -- Hard center exclusion: never accept a target near the keeper's lane.
+        if x * side < half * 0.34 then return false end
+
+        local nearestKeeper = math.huge
+        for _, keeper in ipairs(f.keepers or {}) do
+            local kx = (keeper.position - f.mouth.center):Dot(f.mouth.lateral)
+            local lateralGap = math.abs(x - kx)
+            nearestKeeper = math.min(nearestKeeper, lateralGap)
+        end
+        -- Require a substantial lateral separation from every tracked keeper.
+        if nearestKeeper < half * 0.30 then return false end
+
+        -- Do not accept a point directly above the keeper while it remains in the
+        -- same lateral lane. High corners on the far side are still allowed.
+        for _, keeper in ipairs(f.keepers or {}) do
+            local kx = (keeper.position - f.mouth.center):Dot(f.mouth.lateral)
+            if math.abs(x - kx) < half * 0.42
+                and math.abs(rating.position.Y - keeper.position.Y) < 1.15 then
+                return false
+            end
+        end
+        return true
+    end
+
     local function shotZone(mouth, point)
         local x = (point - mouth.center):Dot(mouth.lateral)
         local height = (point.Y - mouth.bottom) / math.max(mouth.top - mouth.bottom, 0.01)
@@ -5906,6 +5970,13 @@ local function createStriker(d)
         owner.flickSide = flickSide
         owner.flickAlpha = flickAlpha
         owner.flickActive = A.FlickAssist and flickSide ~= 0 and flickAlpha > 0
+        local bestShotSide = preferredShotSide(f)
+        owner.bestShotSide = bestShotSide
+        if normal and not owner.flickActive and not bestShotTargetAllowed(f, normal, bestShotSide) then
+            normal = nil
+        end
+        local bestShotSide = preferredShotSide(f)
+        owner.bestShotSide = bestShotSide
         local audit = { scope = "current aim and freshly checked proposals", checked = {}, duplicatesSkipped = 0,
             rawScore = normal and normal.score, rawDefenderRisk = normal and normal.defenderRisk,
             rawCurve = f.curve, frameAt = f.clock, predictionCharge = f.charge }
@@ -6017,7 +6088,9 @@ local function createStriker(d)
             shortlist = lanes
         end
         for _, entry in ipairs(shortlist) do
-            local wantedLane = flickSide == 0 or candidateSide(f, entry) == flickSide
+            local wantedLane = flickSide ~= 0
+                and candidateSide(f, entry) == flickSide
+                or (bestShotTargetAllowed(f, entry.rating, bestShotSide))
             if wantedLane and (requiredCurve == nil or entry.curve == requiredCurve)
                 and compatible(entry.frame, f) and clock - entry.at <= C.CandidateAge then
                 local aim = candidateAim(entry, f)
@@ -6126,6 +6199,35 @@ local function createStriker(d)
             end
         else
             owner.flickFallback = false
+        end
+        -- If the cached search did not produce a far-side candidate, create a
+        -- small deterministic far-side set now. These are still passed through
+        -- rate(), so no blind target is applied.
+        if not chosen and not owner.flickActive then
+            local inset = f.radius + C.EdgeMargin + C.TargetSlack
+            local half = f.mouth.halfWidth - inset
+            local low = f.mouth.bottom + f.radius + 0.4
+            local high = f.mouth.top - inset
+            if half > 0 and high > low then
+                local targets = { 0.72, 0.52, 0.32 }
+                for _, ratio in ipairs(targets) do
+                    if not chosen then
+                        local x = half * ratio * bestShotSide
+                        local y = low + (high - low) * ratio
+                        local point = targetPoint(f.mouth, Vector2.new(x, y))
+                        local origin = f.sample.Origin + (f.aimOffset or V0)
+                        local direction = point - origin
+                        if vec(direction) and direction.Magnitude > 1e-5 then
+                            local yaw, pitch = angles(direction.Unit)
+                            local aim = aimAt(f, yaw, pitch)
+                            local rating = rate(f, aim, false)
+                            if rating and bestShotTargetAllowed(f, rating, bestShotSide) then
+                                chosen, best, selectedCandidate, selectedCurve = aim, rating, nil, f.curve
+                            end
+                        end
+                    end
+                end
+            end
         end
         if choice and not chosen then
             -- A commitment is not a cached collision verdict. If no checked route
