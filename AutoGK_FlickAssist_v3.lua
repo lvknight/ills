@@ -8094,7 +8094,7 @@ local keybindConnection = UserInputService.InputBegan:Connect(function(input, pr
         end
     end
 end)
-connections[#connections + 1] = keybindConnection
+S.connections[#S.connections + 1] = keybindConnection
 ENV.AutoGKKeybinds = FeatureKeybinds
 EVALUATION.ConfigureComparison(MISC.ObserveDribbleGate, function()
     return { bestShot = STR.Enabled, autoCurve = STR.AutoCurve, smartRelease = STR.SmartRelease,
