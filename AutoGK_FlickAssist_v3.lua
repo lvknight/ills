@@ -130,7 +130,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-local BUILD = "Auto GK 3.2.10 | STR 0.17 | Misc 0.7 | Evaluation 0.2"
+local BUILD = "Auto GK 3.2.12 | STR 0.17 | Misc 0.7 | Evaluation 0.2"
 local ENV = _G
 if type(getgenv) == "function" then
     local ok, environment = pcall(getgenv)
@@ -257,6 +257,25 @@ local Config = {
     RuntimeErrorRetrySeconds = 0.25,
     RuntimeErrorLimit = 3,
     Debug = false,
+}
+
+-- User-configurable feature keybinds. These toggle the corresponding feature;
+-- they do not replace the game's movement/dive keys.
+local FeatureKeybinds = {
+    AutoSave = "F1",
+    CloseRangeRush = "F2",
+    HighBallJumps = "F3",
+    JumpThenDive = "F4",
+    BackwardRecovery = "F5",
+    PositionAssist = "F6",
+    PreShotCoverage = "F7",
+    ManualMovementFirst = "F8",
+    BestShotAssist = "F9",
+    FlickAssist = "F10",
+    AutoCurve = "F11",
+    SmartRelease = "F12",
+    AutoDribble = "Z",
+    InfiniteStamina = "X",
 }
 
 local Stats = {
@@ -3069,6 +3088,13 @@ local function position(f, dt)
         and remaining > 0
         and f.goalPosition ~= nil
 
+    -- In SIDES mode, do not pre-steer laterally while a shot threat is active.
+    -- This prevents an opposite-side correction (A/D) before the actual dive.
+    if Config.DiveFilter == "SIDES" and threat and not S.jump then
+        releaseMove(true)
+        return
+    end
+
     local coverage = f.isCoverage == true
 
     if coverage and not Config.PreShotCoverage then
@@ -4680,7 +4706,7 @@ local function createStriker(d)
         ReleaseInterval = 0.05, ReleaseMargin = 0.35, ReleaseBudgetMs = 2.5,
         FlickTriggerCharge = 0.80, FlickCenterThreshold = 0.22, FlickKeeperDeadzone = 0.70,
         FlickMaxChecks = 5, FlickEdgeInset = 0.94, FlickFallbackInset = 0.82,
-        BestShotMaxChecks = 12 }
+        BestShotMaxChecks = 12, BestShotSwitchCharge = 0.65 }
     local stats = { shots = 0, assisted = 0, redirected = 0, flicks = 0, confirmed = 0, rejected = 0, candidates = 0, evaluations = 0,
         errors = 0, maxSliceMs = 0, maxAimMs = 0, lastCharge = 0, lastCurve = 0,
         releaseChecks = 0, releaseBudgetSkips = 0, releaseRequests = 0, autoReleases = 0, maxReleaseMs = 0 }
@@ -5972,11 +5998,13 @@ local function createStriker(d)
         owner.flickActive = A.FlickAssist and flickSide ~= 0 and flickAlpha > 0
         local bestShotSide = preferredShotSide(f)
         owner.bestShotSide = bestShotSide
-        if normal and not owner.flickActive and not bestShotTargetAllowed(f, normal, bestShotSide) then
+        local bestShotSwitchCharge = math.clamp(C.BestShotSwitchCharge or 0.65, 0, 0.95)
+        local bestShotReady = (f.charge or 0) >= bestShotSwitchCharge
+        owner.bestShotReady = bestShotReady
+        if normal and not owner.flickActive and bestShotReady
+            and not bestShotTargetAllowed(f, normal, bestShotSide) then
             normal = nil
         end
-        local bestShotSide = preferredShotSide(f)
-        owner.bestShotSide = bestShotSide
         local audit = { scope = "current aim and freshly checked proposals", checked = {}, duplicatesSkipped = 0,
             rawScore = normal and normal.score, rawDefenderRisk = normal and normal.defenderRisk,
             rawCurve = f.curve, frameAt = f.clock, predictionCharge = f.charge }
@@ -6090,7 +6118,7 @@ local function createStriker(d)
         for _, entry in ipairs(shortlist) do
             local wantedLane = flickSide ~= 0
                 and candidateSide(f, entry) == flickSide
-                or (bestShotTargetAllowed(f, entry.rating, bestShotSide))
+                or (bestShotReady and bestShotTargetAllowed(f, entry.rating, bestShotSide))
             if wantedLane and (requiredCurve == nil or entry.curve == requiredCurve)
                 and compatible(entry.frame, f) and clock - entry.at <= C.CandidateAge then
                 local aim = candidateAim(entry, f)
@@ -6152,6 +6180,7 @@ local function createStriker(d)
         -- A valid current aim is also a candidate, including while alternatives are still solving.
         -- Retain it under the same scoped correction guard instead of giving it back to another aim helper.
         local confirmed = not owner.flickActive and normal and (requiredCurve == nil or f.curve == requiredCurve)
+            and (not bestShotReady or bestShotTargetAllowed(f, normal, bestShotSide))
             and not betterRating(best, normal)
         if confirmed then chosen, best, selectedCandidate, selectedCurve = table.clone(sample), normal, nil, f.curve end
         -- If Flick Assist is active, never silently replace a valid opposite-side
@@ -6203,7 +6232,7 @@ local function createStriker(d)
         -- If the cached search did not produce a far-side candidate, create a
         -- small deterministic far-side set now. These are still passed through
         -- rate(), so no blind target is applied.
-        if not chosen and not owner.flickActive then
+        if not chosen and not owner.flickActive and bestShotReady then
             local inset = f.radius + C.EdgeMargin + C.TargetSlack
             local half = f.mouth.halfWidth - inset
             local low = f.mouth.bottom + f.radius + 0.4
@@ -6233,7 +6262,9 @@ local function createStriker(d)
             -- A commitment is not a cached collision verdict. If no checked route
             -- with this curve is valid now, allow the validated ordinary fallback.
             owner.curveChoice, choice = nil, nil
-            if normal then chosen, best, selectedCandidate, selectedCurve = table.clone(sample), normal, nil, f.curve end
+            if normal and (not bestShotReady or bestShotTargetAllowed(f, normal, bestShotSide)) then
+                chosen, best, selectedCandidate, selectedCurve = table.clone(sample), normal, nil, f.curve
+            end
         end
         owner.selectedCandidate = selectedCandidate
         owner.completedAlternatives = #owner.candidates
@@ -7978,6 +8009,93 @@ local MISC = createStrikerMisc({
     suspended = function() return S.uiBusy or not S.focused end, evaluation = EVALUATION,
 })
 S.releaseMisc = MISC.Cleanup
+
+--==============================================================
+-- FEATURE KEYBINDS
+--==============================================================
+local keybindCapture = nil
+local keybindRefreshers = {}
+
+local function keyCodeFromName(name)
+    if type(name) ~= "string" then return Enum.KeyCode.Unknown end
+    local ok, key = pcall(function() return Enum.KeyCode[name] end)
+    return ok and key or Enum.KeyCode.Unknown
+end
+
+local function keyName(key)
+    if typeof(key) ~= "EnumItem" or key.EnumType ~= Enum.KeyCode then return "None" end
+    return key.Name
+end
+
+local function setFeatureKeybind(name, key)
+    local value = keyName(key)
+    if value == "Unknown" then return false end
+    FeatureKeybinds[name] = value
+    for _, refresh in ipairs(keybindRefreshers) do pcall(refresh) end
+    return true
+end
+
+local function toggleFeatureByKey(name)
+    if name == "AutoSave" then
+        toggleEnabled(not ENV.AUTO_GK_ENABLED)
+    elseif name == "CloseRangeRush" then
+        Config.CloseRangeRush = not Config.CloseRangeRush
+        Rush.candidate = nil
+    elseif name == "HighBallJumps" then
+        Config.HighBallJumps = not Config.HighBallJumps
+    elseif name == "JumpThenDive" then
+        Config.JumpThenDive = not Config.JumpThenDive
+    elseif name == "BackwardRecovery" then
+        Config.BackwardRecovery = not Config.BackwardRecovery
+    elseif name == "PositionAssist" then
+        Config.PositionAssist = not Config.PositionAssist
+        if not Config.PositionAssist then invalidateFrame(true) end
+    elseif name == "PreShotCoverage" then
+        Config.PreShotCoverage = not Config.PreShotCoverage
+        invalidateFrame(true)
+    elseif name == "ManualMovementFirst" then
+        Config.RespectManualMovement = not Config.RespectManualMovement
+    elseif name == "BestShotAssist" then
+        STR.SetEnabled(not STR.Enabled)
+    elseif name == "FlickAssist" then
+        STR.SetFlickAssist(not STR.FlickAssist)
+    elseif name == "AutoCurve" then
+        STR.SetAutoCurve(not STR.AutoCurve)
+    elseif name == "SmartRelease" then
+        STR.SetSmartRelease(not STR.SmartRelease)
+    elseif name == "AutoDribble" then
+        MISC.SetAutoDribble(not MISC.AutoDribble)
+    elseif name == "InfiniteStamina" then
+        MISC.SetInfiniteStamina(not MISC.InfiniteStamina)
+    end
+end
+
+local keybindConnection = UserInputService.InputBegan:Connect(function(input, processed)
+    if not S.alive then return end
+    if keybindCapture then
+        if input.UserInputType == Enum.UserInputType.Keyboard
+            and input.KeyCode ~= Enum.KeyCode.Unknown then
+            local capture = keybindCapture
+            keybindCapture = nil
+            setFeatureKeybind(capture, input.KeyCode)
+        elseif input.KeyCode == Enum.KeyCode.Escape then
+            keybindCapture = nil
+            for _, refresh in ipairs(keybindRefreshers) do pcall(refresh) end
+        end
+        return
+    end
+    if processed then return end
+    if input.UserInputType ~= Enum.UserInputType.Keyboard
+        or input.KeyCode == Enum.KeyCode.Unknown then return end
+    for feature, binding in pairs(FeatureKeybinds) do
+        if keyCodeFromName(binding) == input.KeyCode then
+            toggleFeatureByKey(feature)
+            break
+        end
+    end
+end)
+connections[#connections + 1] = keybindConnection
+ENV.AutoGKKeybinds = FeatureKeybinds
 EVALUATION.ConfigureComparison(MISC.ObserveDribbleGate, function()
     return { bestShot = STR.Enabled, autoCurve = STR.AutoCurve, smartRelease = STR.SmartRelease,
         autoDribble = MISC.AutoDribble, infiniteStamina = MISC.InfiniteStamina }
@@ -8007,6 +8125,7 @@ local function saveConfig()
             autoDribble = MISC.AutoDribble,
             infiniteStamina = MISC.InfiniteStamina,
         },
+        keybinds = table.clone(FeatureKeybinds),
     }
     for key, value in pairs(Config) do
         local valueType = typeof(value)
@@ -8055,6 +8174,13 @@ local function loadConfig()
     if type(mi) == "table" then
         if mi.autoDribble ~= nil then MISC.SetAutoDribble(mi.autoDribble == true) end
         if mi.infiniteStamina ~= nil then MISC.SetInfiniteStamina(mi.infiniteStamina == true) end
+    end
+    if type(data.keybinds) == "table" then
+        for name, key in pairs(data.keybinds) do
+            if FeatureKeybinds[name] ~= nil and type(key) == "string" then
+                FeatureKeybinds[name] = key
+            end
+        end
     end
     return true, "loaded"
 end
@@ -8345,6 +8471,43 @@ do
         order = 0
     end
 
+    local function keybindRow(label, featureName)
+        order = order + 1
+        local row = frame(activeBody, label, 0, 0, 0, 32)
+        row.BackgroundTransparency = 1
+        row.Size = UDim2.new(1, 0, 0, 32)
+        row.LayoutOrder = order
+        text(row, label, 11, {
+            Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -116, 1, 0),
+            TextColor3 = C.muted,
+        })
+        local bind = button(row, {
+            Name = "Keybind", Position = UDim2.new(1, -96, 2, 0),
+            Size = UDim2.fromOffset(84, 28),
+        })
+        bind.Position = UDim2.new(1, -96, 0, 2)
+        stroke(bind)
+        local previous = nil
+        local function refresh(immediate)
+            local textValue = keybindCapture == featureName and "PRESS KEY" or (FeatureKeybinds[featureName] or "None")
+            if textValue == previous then return end
+            previous = textValue
+            bind.Text = textValue
+            bind.TextSize = 9
+            bind.TextColor3 = keybindCapture == featureName and C.accent or C.text
+            if immediate then bind.BackgroundColor3 = C.control end
+        end
+        hover(bind)
+        connect(bind.Activated, function()
+            if not S.alive then return end
+            closeDropdown()
+            keybindCapture = featureName
+            for _, repaint in ipairs(keybindRefreshers) do pcall(repaint) end
+        end)
+        refresh(true)
+        table.insert(keybindRefreshers, function() refresh(false) end)
+    end
+
     local function toggle(label, getter, setter)
         order = order + 1
         local control = button(activeBody, {
@@ -8560,6 +8723,7 @@ do
         end,
         toggleEnabled
     )
+    keybindRow("Auto save key", "AutoSave")
 
     toggle(
         "Close-range rush",
@@ -8573,6 +8737,7 @@ do
             Rush.candidate = nil
         end
     )
+    keybindRow("Close rush key", "CloseRangeRush")
 
     toggle(
         "High-ball jumps",
@@ -8585,6 +8750,7 @@ do
             Config.HighBallJumps = value
         end
     )
+    keybindRow("High-ball key", "HighBallJumps")
 
     toggle(
         "Jump then dive",
@@ -8597,6 +8763,7 @@ do
             Config.JumpThenDive = value
         end
     )
+    keybindRow("Jump dive key", "JumpThenDive")
 
     dropdown(
         "Dive direction",
@@ -8631,6 +8798,7 @@ do
             Config.BackwardRecovery = value
         end
     )
+    keybindRow("Back recovery key", "BackwardRecovery")
 
     section("POSITIONING")
 
@@ -8649,6 +8817,7 @@ do
             end
         end
     )
+    keybindRow("Position assist key", "PositionAssist")
 
     toggle(
         "Pre-shot coverage",
@@ -8662,6 +8831,7 @@ do
             invalidateFrame(true)
         end
     )
+    keybindRow("Coverage key", "PreShotCoverage")
 
     dropdown(
         "Position mode",
@@ -8695,6 +8865,7 @@ do
             Config.RespectManualMovement = value
         end
     )
+    keybindRow("Manual movement key", "ManualMovementFirst")
 
     local gkRefresherCount = #refreshers
     local shootingSection = frame(strikerContent, "Shooting", 0, 0, 292, 184)
@@ -8710,10 +8881,14 @@ do
     }, activeBody)
     order = 0
     toggle("Best shot assist", function() return STR.Enabled end, STR.SetEnabled)
+    keybindRow("Best shot key", "BestShotAssist")
     toggle("Flick Assist", function() return STR.FlickAssist end, STR.SetFlickAssist)
+    keybindRow("Flick key", "FlickAssist")
     slider("Flick Smoothness", function() return STR.FlickSmoothness end, STR.SetFlickSmoothness, 1, 10)
     toggle("Auto curve ball", function() return STR.AutoCurve end, STR.SetAutoCurve)
+    keybindRow("Auto curve key", "AutoCurve")
     toggle("Smart shot release", function() return STR.SmartRelease end, STR.SetSmartRelease)
+    keybindRow("Smart release key", "SmartRelease")
     local miscellaneousSection = frame(strikerContent, "Miscellaneous", 0, 198, 292, 125)
     miscellaneousSection.BackgroundTransparency = 1
     text(miscellaneousSection, "MISCELLANEOUS", 9, {
@@ -8727,7 +8902,9 @@ do
     }, activeBody)
     order = 0
     toggle("Auto dribble", function() return MISC.AutoDribble end, MISC.SetAutoDribble)
+    keybindRow("Auto dribble key", "AutoDribble")
     toggle("Infinite stamina", function() return MISC.InfiniteStamina end, MISC.SetInfiniteStamina)
+    keybindRow("Infinite stamina key", "InfiniteStamina")
     order = order + 1
     local saveButton = button(activeBody, {
         Name = "SaveConfig", Text = "SAVE CONFIG", TextSize = 10,
