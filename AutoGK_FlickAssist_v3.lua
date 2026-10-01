@@ -262,20 +262,21 @@ local Config = {
 -- User-configurable feature keybinds. These toggle the corresponding feature;
 -- they do not replace the game's movement/dive keys.
 local FeatureKeybinds = {
-    AutoSave = "F1",
-    CloseRangeRush = "F2",
-    HighBallJumps = "F3",
-    JumpThenDive = "F4",
-    BackwardRecovery = "F5",
-    PositionAssist = "F6",
-    PreShotCoverage = "F7",
-    ManualMovementFirst = "F8",
-    BestShotAssist = "F9",
-    FlickAssist = "F10",
-    AutoCurve = "F11",
-    SmartRelease = "F12",
-    AutoDribble = "Z",
-    InfiniteStamina = "X",
+    -- Empty by default. The player must assign each key manually from the UI.
+    AutoSave = "",
+    CloseRangeRush = "",
+    HighBallJumps = "",
+    JumpThenDive = "",
+    BackwardRecovery = "",
+    PositionAssist = "",
+    PreShotCoverage = "",
+    ManualMovementFirst = "",
+    BestShotAssist = "",
+    FlickAssist = "",
+    AutoCurve = "",
+    SmartRelease = "",
+    AutoDribble = "",
+    InfiniteStamina = "",
 }
 
 local Stats = {
@@ -8175,9 +8176,17 @@ local function loadConfig()
         if mi.infiniteStamina ~= nil then MISC.SetInfiniteStamina(mi.infiniteStamina == true) end
     end
     if type(data.keybinds) == "table" then
+        local legacyDefaults = {
+            AutoSave = "F1", CloseRangeRush = "F2", HighBallJumps = "F3",
+            JumpThenDive = "F4", BackwardRecovery = "F5", PositionAssist = "F6",
+            PreShotCoverage = "F7", ManualMovementFirst = "F8", BestShotAssist = "F9",
+            FlickAssist = "F10", AutoCurve = "F11", SmartRelease = "F12",
+            AutoDribble = "Z", InfiniteStamina = "X",
+        }
         for name, key in pairs(data.keybinds) do
             if FeatureKeybinds[name] ~= nil and type(key) == "string" then
-                FeatureKeybinds[name] = key
+                -- Migrate the old built-in defaults to unbound; keep player-custom keys.
+                FeatureKeybinds[name] = legacyDefaults[name] == key and "" or key
             end
         end
     end
@@ -8321,9 +8330,15 @@ do
     local tabBar = frame(panel, "Tabs", 12, 44, 292, 26)
     tabBar.BackgroundTransparency = 1
     -- STR is independent of the goalkeeper automation toggle.
-    local strikerContent = frame(panel, "STRContent", 12, 76, 292, 406)
-    strikerContent.BackgroundTransparency = 1
-    strikerContent.Visible = false
+    local strikerContent = create("ScrollingFrame", {
+        Name = "STRContent", Position = UDim2.fromOffset(12, 76),
+        Size = UDim2.fromOffset(292, 406), BackgroundTransparency = 1,
+        BorderSizePixel = 0, ClipsDescendants = true, Visible = false,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
+        ScrollBarThickness = 2, ScrollBarImageColor3 = C.accentDim,
+        CanvasSize = UDim2.fromOffset(292, 735),
+    }, panel)
+    strikerContent.AutomaticCanvasSize = Enum.AutomaticSize.None
     local live = round(frame(panel, "LiveStatus", 12, 76, 292, 28, C.surface), 5)
     local dot = round(frame(live, "StatusDot", 10, 11, 6, 6, C.muted), 3)
     local stateText = text(live, "STARTING", 10, {
@@ -8867,13 +8882,13 @@ do
     keybindRow("Manual movement key", "ManualMovementFirst")
 
     local gkRefresherCount = #refreshers
-    local shootingSection = frame(strikerContent, "Shooting", 0, 0, 292, 184)
+    local shootingSection = frame(strikerContent, "Shooting", 0, 0, 292, 345)
     shootingSection.BackgroundTransparency = 1
     text(shootingSection, "SHOOTING", 9, {
         Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(292, 16),
         Font = Enum.Font.GothamMedium, TextColor3 = C.accentDim,
     })
-    activeBody = frame(shootingSection, "Options", 0, 22, 292, 144)
+    activeBody = frame(shootingSection, "Options", 0, 22, 292, 320)
     activeBody.BackgroundTransparency = 1
     create("UIListLayout", {
         Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder,
@@ -8888,13 +8903,13 @@ do
     keybindRow("Auto curve key", "AutoCurve")
     toggle("Smart shot release", function() return STR.SmartRelease end, STR.SetSmartRelease)
     keybindRow("Smart release key", "SmartRelease")
-    local miscellaneousSection = frame(strikerContent, "Miscellaneous", 0, 198, 292, 125)
+    local miscellaneousSection = frame(strikerContent, "Miscellaneous", 0, 350, 292, 203)
     miscellaneousSection.BackgroundTransparency = 1
     text(miscellaneousSection, "MISCELLANEOUS", 9, {
         Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(292, 16),
         Font = Enum.Font.GothamMedium, TextColor3 = C.accentDim,
     })
-    activeBody = frame(miscellaneousSection, "Options", 0, 22, 292, 103)
+    activeBody = frame(miscellaneousSection, "Options", 0, 22, 292, 165)
     activeBody.BackgroundTransparency = 1
     create("UIListLayout", {
         Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder,
@@ -8919,21 +8934,21 @@ do
         end)
     end)
     local strikerStatus = text(strikerContent, "OFF", 11, {
-        Name = "StrikerStatus", Position = UDim2.fromOffset(8, 315),
+        Name = "StrikerStatus", Position = UDim2.fromOffset(8, 565),
         Size = UDim2.fromOffset(276, 30), TextWrapped = true,
         Font = Enum.Font.GothamMedium, TextColor3 = C.accent,
     })
     local strikerDetail = text(strikerContent, "", 10, {
-        Name = "StrikerDetail", Position = UDim2.fromOffset(8, 349),
+        Name = "StrikerDetail", Position = UDim2.fromOffset(8, 599),
         Size = UDim2.fromOffset(276, 54), TextWrapped = true,
         TextColor3 = C.muted,
     })
     local miscellaneousStatus = text(strikerContent, "", 9, {
-        Name = "MiscStatus", Position = UDim2.fromOffset(8, 406), Size = UDim2.fromOffset(276, 28),
+        Name = "MiscStatus", Position = UDim2.fromOffset(8, 659), Size = UDim2.fromOffset(276, 28),
         TextWrapped = true, TextColor3 = C.accentDim,
     })
     text(strikerContent, "Shots: within 55 studs. Hold for smart release.\nDribble: nearby opponents within 9 studs.", 10, {
-        Position = UDim2.fromOffset(8, 439), Size = UDim2.fromOffset(276, 32),
+        Position = UDim2.fromOffset(8, 693), Size = UDim2.fromOffset(276, 32),
         TextWrapped = true, TextColor3 = C.muted,
     })
 
