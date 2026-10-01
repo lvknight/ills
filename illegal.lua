@@ -8906,7 +8906,7 @@ end
 -- INTERFACE
 --==============================================================
 
-do
+local function buildDmcInterface() -- own function: Luau allows max 200 active locals per function
     local oldGui = PlayerGui:FindFirstChild("AutoGKInterface")
     if oldGui then oldGui:Destroy() end
 
@@ -10361,6 +10361,8 @@ do
     end)
     refresh()
 end
+
+buildDmcInterface()
 
 --==============================================================
 -- SHUTDOWN
