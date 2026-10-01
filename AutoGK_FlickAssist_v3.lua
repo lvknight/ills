@@ -1,3 +1,379 @@
+local function createAutoSprint(d)
+    local A = { AutoSprint = false, Status = "OFF", LastError = nil }
+    local native, heartbeat, removing, focus, removingCharacter = nil, nil, nil, nil, nil
+    local ownsToggle, loading, alive, revision, nextTick = false, false, true, 0, 0
+    local function publish()
+        if d.changed then d.changed(A) end
+    end
+    local function disconnect()
+        if heartbeat then heartbeat:Disconnect(); heartbeat = nil end
+        if removing then removing:Disconnect(); removing = nil end
+        if focus then focus:Disconnect(); focus = nil end
+    end
+    local function release()
+        if not ownsToggle then return true end
+        local ok, err = pcall(function()
+            if native.IsSprintButtonToggled() then native.ToggleSprintButton() end
+            assert(not native.IsSprintButtonToggled(), "Sprint toggle was not released")
+        end)
+        if ok then ownsToggle = false else A.LastError = tostring(err) end
+        return ok
+    end
+    local function fail(err)
+        A.LastError, A.AutoSprint = tostring(err), false
+        revision += 1
+        disconnect()
+        A.Status = release() and "ERROR" or "CLEANUP REQUIRED"
+        publish()
+        warn("[Dmc Auto sprint] " .. A.LastError)
+        return false
+    end
+    local function allowed()
+        if not (alive and A.AutoSprint and d.alive()) then return false end
+        if d.suspended() or d.Gui.MenuIsOpen or d.Input:GetFocusedTextBox() then return false end
+        local character = d.Player.Character
+        local humanoid = character and character.Parent and character ~= removingCharacter
+            and character:FindFirstChildOfClass("Humanoid") or nil
+        return humanoid ~= nil and humanoid.Parent == character and humanoid.Health > 0
+    end
+    local function sync()
+        if not allowed() then
+            assert(release(), A.LastError or "Could not release auto sprint")
+            A.Status = "PAUSED"
+        elseif native.IsSprintButtonToggled() then
+            A.Status = "ON"
+        elseif native.IsSprintButtonUsable() then
+            -- Keyboard Shift and joystick intent use separate native held flags.
+            -- Removing this toggle does not release either of those manual inputs.
+            ownsToggle = true
+            native.ToggleSprintButton()
+            assert(native.IsSprintButtonToggled(), "Sprint toggle was not accepted")
+            A.Status = "ON"
+        else
+            -- Native exhaustion clears the button. Wait until the game permits a restart.
+            ownsToggle = false
+            A.Status = "WAITING"
+        end
+        publish()
+    end
+    function A.SetAutoSprint(value)
+        value = value == true
+        if value and A.AutoSprint then return not loading end
+        revision += 1
+        local request = revision
+        if not value then
+            A.AutoSprint = false
+            disconnect()
+            local ok = release()
+            A.Status = ok and "OFF" or "CLEANUP REQUIRED"
+            publish()
+            return ok
+        end
+        if not alive or not d.alive() then return false end
+        A.AutoSprint, A.Status, loading = true, "STARTING", true
+        publish()
+        local ok, err = pcall(function()
+            native = native or d.load("Client.Gameplay.Player.Sprint")
+            for _, name in ipairs({ "ToggleSprintButton", "IsSprintButtonToggled", "IsSprintButtonUsable" }) do
+                assert(type(native[name]) == "function", "Native sprint API unavailable: " .. name)
+            end
+        end)
+        loading = false
+        if request ~= revision or not (alive and A.AutoSprint and d.alive()) then return false end
+        if not ok then return fail(err) end
+        ok, err = pcall(sync)
+        if not ok then return fail(err) end
+        nextTick = 0
+        heartbeat = d.Run.Heartbeat:Connect(function()
+            if not A.AutoSprint then return end
+            local now = os.clock()
+            if now < nextTick then return end
+            nextTick = now + 0.1
+            local worked, detail = pcall(sync)
+            if not worked then fail(detail) end
+        end)
+        removing = d.Player.CharacterRemoving:Connect(function(character)
+            removingCharacter = character
+            if A.AutoSprint then
+                if not release() then fail(A.LastError) else A.Status = "PAUSED"; publish() end
+            end
+        end)
+        focus = d.Input.WindowFocusReleased:Connect(function()
+            if A.AutoSprint then
+                if not release() then fail(A.LastError) else A.Status = "PAUSED"; publish() end
+            end
+        end)
+        return true
+    end
+    function A.Cleanup()
+        alive = false
+        return A.SetAutoSprint(false)
+    end
+    function A.Debug()
+        return { enabled = A.AutoSprint, status = A.Status, ownsToggle = ownsToggle,
+            lastError = A.LastError, version = "Auto sprint 1.0" }
+    end
+    return A
+end
+
+
+-- Local settings storage. The fixed filename never depends on a config name.
+local function createDmcConfigStore(d)
+    local A = { Accent = "DEC173", RainbowUI = false, Selected = "", Storage = "Session only", Notice = "" }
+    local document = { schema = 1, profiles = {}, accent = A.Accent, rainbowUI = false, selected = "" }
+    local blockedFile = false
+    local boolKeys = { "Enabled", "CloseRangeRush", "HighBallJumps", "JumpThenDive",
+        "BackwardRecovery", "PositionAssist", "PreShotCoverage", "RespectManualMovement" }
+    local diveModes = { SMART = true, FORWARD = true, LEFT = true, RIGHT = true, SIDES = true }
+    local function copy(value)
+        if type(value) ~= "table" then return value end
+        local result = {}
+        for key, item in pairs(value) do result[key] = copy(item) end
+        return result
+    end
+    function A.Color(value)
+        if type(value) ~= "string" then return nil end
+        local hex = value:match("^%s*#?([%x]+)%s*$")
+        return hex and #hex == 6 and string.upper(hex) or nil
+    end
+    local function name(value)
+        if type(value) ~= "string" then return nil end
+        value = value:match("^%s*(.-)%s*$")
+        if #value < 1 or #value > 40 or value:find("[%c]") then return nil end
+        return value
+    end
+    function A.Validate(value)
+        if type(value) ~= "table" or type(value.goalkeeper) ~= "table"
+            or type(value.striker) ~= "table" or type(value.misc) ~= "table" then return nil end
+        local gk, striker, misc = {}, {}, {}
+        for _, key in ipairs(boolKeys) do
+            if type(value.goalkeeper[key]) ~= "boolean" then return nil end
+            gk[key] = value.goalkeeper[key]
+        end
+        if not diveModes[value.goalkeeper.DiveFilter] then return nil end
+        if value.goalkeeper.PositionMode ~= "THREATS"
+            and value.goalkeeper.PositionMode ~= "HOME_AND_THREATS" then return nil end
+        gk.DiveFilter, gk.PositionMode = value.goalkeeper.DiveFilter, value.goalkeeper.PositionMode
+        for _, key in ipairs({ "Enabled", "AutoCurve", "SmartRelease" }) do
+            if type(value.striker[key]) ~= "boolean" then return nil end
+            striker[key] = value.striker[key]
+        end
+        local range = value.striker.Range
+        if type(range) ~= "number" or range ~= range or range < 40 or range > 100 then return nil end
+        striker.Range = math.floor(range + 0.5)
+        for _, key in ipairs({ "AutoDribble", "InfiniteStamina" }) do
+            if type(value.misc[key]) ~= "boolean" then return nil end
+            misc[key] = value.misc[key]
+        end
+        if value.misc.AutoSprint ~= nil and type(value.misc.AutoSprint) ~= "boolean" then return nil end
+        misc.AutoSprint = value.misc.AutoSprint == true
+        local accent = A.Color(value.accent)
+        if not accent then return nil end
+        if value.rainbowUI ~= nil and type(value.rainbowUI) ~= "boolean" then return nil end
+        return { goalkeeper = gk, striker = striker, misc = misc, accent = accent, rainbowUI = value.rainbowUI == true }
+    end
+    local function decode(raw)
+        if type(raw) ~= "string" or #raw > 262144 then return false end
+        local ok, value = pcall(d.decode, raw)
+        if not ok or type(value) ~= "table" or value.schema ~= 1 or type(value.profiles) ~= "table" then return false end
+        local profiles, count = {}, 0
+        for key, profile in pairs(value.profiles) do
+            local validName, validProfile = name(key), A.Validate(profile)
+            if validName == key and validProfile and count < 50 then
+                profiles[key], count = validProfile, count + 1
+            else A.Notice = "Some invalid configs were skipped." end
+        end
+        document = { schema = 1, profiles = profiles, accent = A.Color(value.accent) or A.Accent,
+            rainbowUI = value.rainbowUI == true,
+            selected = name(value.selected) or "",
+            acknowledgedVersion = type(value.acknowledgedVersion) == "string" and value.acknowledgedVersion or nil }
+        if not profiles[document.selected] then document.selected = "" end
+        return true
+    end
+    local canFile = type(d.read) == "function" and type(d.write) == "function"
+    if type(d.cache) == "string" then decode(d.cache) end
+    if canFile then
+        local exists = true
+        if type(d.exists) == "function" then
+            local ok, result = pcall(d.exists, d.path)
+            if ok then exists = result == true end
+        end
+        if exists then
+            local ok, raw = pcall(d.read, d.path)
+            if ok and not decode(raw) then
+                blockedFile = true
+                A.Notice = "Settings file is unreadable; saved configs in that file were kept untouched."
+            elseif not ok and type(d.exists) == "function" then
+                blockedFile = true
+                A.Notice = "Settings file could not be read; using this session."
+            end
+        end
+        A.Storage = blockedFile and "Session only · file unavailable" or "Local file · " .. d.path
+    end
+    A.Accent, A.RainbowUI, A.Selected = document.accent, document.rainbowUI, document.selected
+    local function persist()
+        document.accent, document.rainbowUI, document.selected = A.Accent, A.RainbowUI, A.Selected
+        local ok, encoded = pcall(d.encode, document)
+        if not ok then return false, "Could not encode settings." end
+        d.remember(encoded)
+        if canFile and not blockedFile then
+            local written, result = pcall(d.write, d.path, encoded)
+            if written and result ~= false then A.Storage = "Local file · " .. d.path; return true, "Saved to local file." end
+            A.Storage = "Session only · file write failed"
+            return true, "Saved for this session; the executor could not write the file."
+        end
+        return true, "Saved for this session; file storage is unavailable."
+    end
+    function A.List()
+        local names = {}
+        for key in pairs(document.profiles) do names[#names + 1] = key end
+        table.sort(names, function(a, b)
+            if string.lower(a) == string.lower(b) then return a < b end
+            return string.lower(a) < string.lower(b)
+        end)
+        return names
+    end
+    function A.Select(value)
+        if not document.profiles[value] then return false end
+        A.Selected = value
+        return true
+    end
+    function A.Save(value, profile, creating)
+        local validName, validProfile = name(value), A.Validate(profile)
+        if not validName then return false, "Enter a config name (1–40 characters)." end
+        if not validProfile then return false, "Current settings could not be saved." end
+        if creating and document.profiles[validName] then return false, "Name already exists. Select it and press Save." end
+        if not creating and not document.profiles[validName] then return false, "Select a config before saving." end
+        if creating and #A.List() >= 50 then return false, "Config limit reached (50)." end
+        local previous, selected = document.profiles[validName], A.Selected
+        document.profiles[validName], A.Selected = validProfile, validName
+        local ok, detail = persist()
+        if not ok then document.profiles[validName], A.Selected = previous, selected end
+        return ok, detail
+    end
+    function A.Get(value)
+        return copy(document.profiles[value])
+    end
+    function A.SetAppearance(value, rainbow)
+        local hex = A.Color(value)
+        if not hex then return false, "Use a six-digit hex color, for example #DEC173." end
+        if type(rainbow) ~= "boolean" then return false, "Rainbow UI must be on or off." end
+        local previousAccent, previousRainbow = A.Accent, A.RainbowUI
+        A.Accent, A.RainbowUI = hex, rainbow
+        local ok, detail = persist()
+        if not ok then A.Accent, A.RainbowUI = previousAccent, previousRainbow end
+        return ok, detail
+    end
+    function A.SetAccent(value)
+        return A.SetAppearance(value, A.RainbowUI)
+    end
+    function A.SetRainbowUI(value)
+        return A.SetAppearance(A.Accent, value)
+    end
+    function A.ShouldPrompt(previousBuild, currentBuild)
+        if document.acknowledgedVersion then return document.acknowledgedVersion ~= d.version end
+        return type(previousBuild) == "string" and previousBuild ~= currentBuild
+    end
+    function A.Acknowledge()
+        if document.acknowledgedVersion == d.version then return true end
+        document.acknowledgedVersion = d.version
+        return persist()
+    end
+    return A
+end
+
+-- Configs use the same feature setters as the controls. A refused native setter
+-- rolls settings back instead of displaying a successful load.
+local function createDmcSettingsController(d)
+    local A = {}
+    function A.Snapshot()
+        local gk = {}
+        for _, key in ipairs({ "CloseRangeRush", "HighBallJumps", "JumpThenDive", "BackwardRecovery",
+            "PositionAssist", "PreShotCoverage", "RespectManualMovement", "PositionMode" }) do gk[key] = d.config[key] end
+        gk.Enabled = d.gkEnabled()
+        gk.DiveFilter = d.config.DiveFilter == "ALL" and "SMART" or d.config.DiveFilter
+        return { goalkeeper = gk,
+            striker = { Enabled = d.striker.Enabled, AutoCurve = d.striker.AutoCurve,
+                SmartRelease = d.striker.SmartRelease, Range = d.striker.GetAssistRange() },
+            misc = { AutoDribble = d.misc.AutoDribble, AutoSprint = d.misc.AutoSprint == true,
+                InfiniteStamina = d.misc.InfiniteStamina },
+            accent = d.accent(), rainbowUI = d.rainbow and d.rainbow() == true or false }
+    end
+    local function apply(profile)
+        local function feature(object, key, value)
+            if object[key] == value then return end
+            assert(object["Set" .. key](value) ~= false, key .. " could not be changed")
+            assert(object[key] == value, key .. " did not accept the setting")
+        end
+        feature(d.striker, "AutoCurve", profile.striker.AutoCurve)
+        feature(d.striker, "SmartRelease", profile.striker.SmartRelease)
+        feature(d.striker, "Enabled", profile.striker.Enabled)
+        assert(d.striker.SetAssistRange(profile.striker.Range) ~= false, "Shot range could not be changed")
+        feature(d.misc, "AutoDribble", profile.misc.AutoDribble)
+        feature(d.misc, "AutoSprint", profile.misc.AutoSprint)
+        feature(d.misc, "InfiniteStamina", profile.misc.InfiniteStamina)
+        for key, value in pairs(profile.goalkeeper) do if key ~= "Enabled" then d.config[key] = value end end
+        d.resetGoalkeeper()
+        if d.gkEnabled() ~= profile.goalkeeper.Enabled then d.setGK(profile.goalkeeper.Enabled) end
+        d.theme(profile.accent)
+        if d.setRainbow then d.setRainbow(profile.rainbowUI == true) end
+    end
+    function A.Load(profile)
+        local valid = d.validate(profile)
+        if not valid then return false, "Config is invalid; settings were not changed." end
+        local previous = A.Snapshot()
+        local ok, err = pcall(apply, valid)
+        if ok then return true, "Config loaded." end
+        local restored = pcall(apply, previous)
+        return false, "Config load failed: " .. tostring(err)
+            .. (restored and ". Previous settings restored." or ". Some settings could not be restored; check the toggles.")
+    end
+    return A
+end
+
+local function showDmcUpdatePrompt(parent, hex)
+    local gui = Instance.new("ScreenGui")
+    gui.Name, gui.ResetOnSpawn, gui.DisplayOrder = "DmcUpdate", false, 1001
+    gui.IgnoreGuiInset = true
+    local shade = Instance.new("Frame")
+    shade.Size, shade.BackgroundColor3, shade.BackgroundTransparency = UDim2.fromScale(1, 1), Color3.fromRGB(0, 0, 0), 0.45
+    shade.Active, shade.BorderSizePixel, shade.Parent = true, 0, gui
+    local accent = Color3.fromRGB(tonumber(hex:sub(1, 2), 16), tonumber(hex:sub(3, 4), 16), tonumber(hex:sub(5, 6), 16))
+    local panel = Instance.new("Frame")
+    panel.AnchorPoint, panel.Position = Vector2.new(0.5, 0.5), UDim2.fromScale(0.5, 0.4)
+    panel.Size, panel.BackgroundColor3, panel.BorderSizePixel = UDim2.new(0.9, 0, 0, 200), Color3.fromRGB(16, 16, 15), 0
+    panel.Parent = shade
+    local limit = Instance.new("UISizeConstraint")
+    limit.MaxSize, limit.Parent = Vector2.new(460, 200), panel
+    local heading = Instance.new("TextLabel")
+    heading.Position, heading.Size = UDim2.fromOffset(14, 8), UDim2.new(1, -28, 0, 28)
+    heading.BackgroundTransparency, heading.TextSize, heading.Font = 1, 18, Enum.Font.FredokaOne
+    heading.TextXAlignment, heading.TextColor3, heading.Text, heading.Parent = Enum.TextXAlignment.Left, accent, "Banyu | Script updated", panel
+    local message = Instance.new("TextLabel")
+    message.Position, message.Size = UDim2.fromOffset(14, 52), UDim2.new(1, -28, 0, 56)
+    message.BackgroundTransparency, message.TextWrapped, message.TextSize = 1, true, 16
+    message.Font, message.TextColor3 = Enum.Font.Nunito, Color3.fromRGB(242, 243, 240)
+    message.Text, message.Parent = "Script updated press OK to continue", panel
+    local okButton = Instance.new("TextButton")
+    okButton.AnchorPoint, okButton.Position, okButton.Size = Vector2.new(0.5, 0), UDim2.new(0.5, 0, 1, -58), UDim2.fromOffset(100, 36)
+    okButton.Name, okButton.Text, okButton.TextSize, okButton.Font = "OK", "OK", 16, Enum.Font.FredokaOne
+    okButton.BackgroundColor3, okButton.TextColor3, okButton.BorderSizePixel = accent, Color3.fromRGB(16, 16, 15), 0
+    okButton.Modal, okButton.Parent = true, panel
+    local acknowledged = false
+    local connection = okButton.Activated:Connect(function() acknowledged = true end)
+    gui.Parent = parent
+    local waited, err = pcall(function()
+        while gui.Parent and not acknowledged do task.wait(0.05) end
+    end)
+    connection:Disconnect()
+    gui:Destroy()
+    assert(waited, err)
+    return acknowledged
+end
+
+
+-- Small, dependency-free startup controller. Game modules are loaded only after
+-- its status panel is visible. No executor-specific GUI or identity API is needed.
 local function createDmcStartup(d)
     local B = {
         stage = "Waiting for the game", finished = false,
@@ -118,7 +494,7 @@ local BOOT = createDmcStartup({
 })
 
 BOOT.Run(function()
--- BANYU MAIN BEGIN
+-- DMC MAIN BEGIN
 --==============================================================
 -- SERVICES
 --==============================================================
@@ -130,12 +506,23 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-local BUILD = "Auto GK 3.2.12 | STR 0.17 | Misc 0.7 | Evaluation 0.2"
+-- Bump the release ID for every shipped update to trigger the one-time OK prompt.
+local RELEASE_VERSION = "2026.10.02.01"
+local BUILD = "Dmc Settings 1.5.1 | GK 3.2.8 | STR 0.16.4 | Misc 0.17.6 | Auto sprint 1.0 | Evaluation 0.2"
 local ENV = _G
 if type(getgenv) == "function" then
     local ok, environment = pcall(getgenv)
     if ok and type(environment) == "table" then ENV = environment end
 end
+
+local settingsHttp = game:GetService("HttpService")
+local SettingsStore = createDmcConfigStore({
+    version = RELEASE_VERSION, path = "Dmc_settings.json", cache = ENV.__DMC_CONFIG_CACHE,
+    read = readfile, write = writefile, exists = isfile,
+    encode = function(value) return settingsHttp:JSONEncode(value) end,
+    decode = function(value) return settingsHttp:JSONDecode(value) end,
+    remember = function(value) ENV.__DMC_CONFIG_CACHE = value end,
+})
 
 -- Keep the current instance running until all dependencies have loaded.
 
@@ -192,6 +579,12 @@ local StateRemote = BallRemotes:WaitForChild("State", 5)
 
 assert(TackleRemote and StateRemote and PlayerGui, "Client is not ready")
 
+if SettingsStore.ShouldPrompt(ENV.AutoGKBuild, BUILD) then
+    BOOT.Status("Waiting for update confirmation")
+    assert(showDmcUpdatePrompt(PlayerGui, SettingsStore.Accent), "Update confirmation was closed before OK.")
+    SettingsStore.Acknowledge()
+end
+
 if type(ENV.__AUTO_GK_CLEANUP) == "function" then
     local called, released, detail = pcall(ENV.__AUTO_GK_CLEANUP)
     assert(called, "Previous Auto GK cleanup threw: " .. tostring(released))
@@ -203,13 +596,6 @@ end
 --==============================================================
 -- CONFIGURATION
 --==============================================================
-
-local SafeConfig = {
-    -- Conservative goalkeeper defaults: only lateral dives and no backward recovery.
-    DiveFilter = "SIDES",
-    BackwardRecovery = false,
-    UIStartHidden = true,
-}
 
 local Config = {
     Enabled = true,
@@ -227,8 +613,8 @@ local Config = {
     RespectManualMovement = true,
     HighBallJumps = true,
     JumpThenDive = true,
-    DiveFilter = SafeConfig.DiveFilter,
-    BackwardRecovery = SafeConfig.BackwardRecovery,
+    DiveFilter = "SMART",
+    BackwardRecovery = true,
     PlannerHz = 12,
     CloseShotPlannerHz = 30,
     UISampleHz = 4,
@@ -259,26 +645,6 @@ local Config = {
     Debug = false,
 }
 
--- User-configurable feature keybinds. These toggle the corresponding feature;
--- they do not replace the game's movement/dive keys.
-local FeatureKeybinds = {
-    -- Empty by default. The player must assign each key manually from the UI.
-    AutoSave = "",
-    CloseRangeRush = "",
-    HighBallJumps = "",
-    JumpThenDive = "",
-    BackwardRecovery = "",
-    PositionAssist = "",
-    PreShotCoverage = "",
-    ManualMovementFirst = "",
-    BestShotAssist = "",
-    FlickAssist = "",
-    AutoCurve = "",
-    SmartRelease = "",
-    AutoDribble = "",
-    InfiniteStamina = "",
-}
-
 local Stats = {
     Requests = 0,
     JumpRequests = 0,
@@ -290,7 +656,6 @@ local Stats = {
 }
 
 ENV.AutoGKConfig = Config
-ENV.AutoGKSafeConfig = SafeConfig
 ENV.AutoGKStats = Stats
 ENV.AUTO_GK_ENABLED = true
 ENV.AutoGKBuild = BUILD
@@ -430,6 +795,7 @@ local function cleanup()
         S.ui = nil
         S.closeDropdown = nil
         S.cancelUITweens = nil
+        S.isUIInput = nil
     end
 
     if S.loopBusy then
@@ -697,6 +1063,8 @@ end
 
 local function invalidateFrame(allowWrite)
     S.lastFrame = nil
+    S.keeperWait = nil
+    S.keeperContact = nil
     S.allowPositioning = false
     S.coverageFrame = nil
     S.coverageNextAt = 0
@@ -1341,6 +1709,7 @@ local function snapshot(character, root, humanoid)
         at = timestamp,
         readClock = readClock,
         sourceTrajectory = sourceTrajectory,
+        lastKickerUserId = state.LastKickerUserId,
         launchAt = nil,
         context = context,
         ballId = ball.ballId,
@@ -1787,6 +2156,28 @@ local function inspectPath(f, plan, points, requireContact)
     }
 end
 
+local function threatSide(f)
+    if not f or not f.context or not f.goalPosition then return 0 end
+    local origin = f.context.goal.Position
+    local half = math.max(0.5, goalHalfWidth(f.context))
+    local x = (f.goalPosition - origin):Dot(f.context.right)
+    if math.abs(x) > half * 0.18 then
+        return x > 0 and 1 or -1
+    end
+
+    local ballX = (f.state.Position - origin):Dot(f.context.right)
+    if math.abs(ballX) > half * 0.12 then
+        return ballX > 0 and 1 or -1
+    end
+
+    local lateralVelocity = f.velocity:Dot(f.context.right)
+    if math.abs(lateralVelocity) > 1.5 then
+        return lateralVelocity > 0 and 1 or -1
+    end
+
+    return 0
+end
+
 local function allowedDirections(f)
     local filter = Config.DiveFilter
     local result
@@ -1798,7 +2189,16 @@ local function allowedDirections(f)
     elseif filter == "RIGHT" then
         result = { "R", "RF" }
     elseif filter == "SIDES" then
-        result = { "L", "R" }
+        -- SIDES is directional, not a blind L/R search. Once the predicted
+        -- crossing is clearly on one side, only that side is considered.
+        local side = threatSide(f)
+        if side < 0 then
+            result = { "L", "LF" }
+        elseif side > 0 then
+            result = { "R", "RF" }
+        else
+            result = { "L", "R", "LF", "RF" }
+        end
     else
         result = { "F", "L", "R", "LF", "RF" }
     end
@@ -2028,6 +2428,207 @@ local function divePathMayReach(f, points, horizon)
         or minZ > math.max(start.Z, finish.Z) + reach)
 end
 
+-- Receiver/blocker forecasts only postpone an already verified dive. They
+-- never suppress a goal-bound ball or authorize a contact on a guessed bounce.
+local KeeperTiming = {
+    ForecastSeconds = 0.35,
+    LaunchReserveSeconds = 0.10,
+    ContactOrderMarginSeconds = 0.035,
+    MinimumWaitSeconds = 0.015,
+    UrgentGoalSeconds = 0.25,
+    Delays = { 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50 },
+}
+
+function KeeperTiming.RootAt(body, t)
+    local dy = body.airborne and math.max(body.floor - body.cf.Position.Y,
+        body.velocity.Y * t - 0.5 * body.gravity * t * t) or 0
+    return body.cf + body.horizontal * t + Vector3.new(0, dy, 0)
+end
+
+function KeeperTiming.PlayerContact(f, character, actor, points, limit)
+    if character == f.character or not character.Parent
+        or M.Motion.GetContext(character) ~= M.Motion.GetContext(f.character) then return nil end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local root = type(M.Motion.GetQueryRoot) == "function" and M.Motion.GetQueryRoot(character)
+        or character:FindFirstChild("HumanoidRootPart")
+    if not humanoid or humanoid.Health <= 0 or not root or not root.Parent then return nil end
+    local cf = M.Motion.GetCFrame(character)
+    local velocity = M.Motion.GetVelocity(character) or root.AssemblyLinearVelocity
+    if typeof(cf) ~= "CFrame" or not finiteVector(cf.Position)
+        or not finiteVector(velocity) then return nil end
+    local state = M.Controllers.GetHumanoidState(character, humanoid)
+    local airborne = state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall
+    local floor = M.Grounding.GetStandingY(humanoid, root)
+    if not finite(floor) then floor = cf.Position.Y end
+    local body = { cf = cf, velocity = velocity, horizontal = flat(velocity),
+        floor = floor, airborne = airborne, gravity = math.max(0, f.gravity) }
+    local landing = airborne and holdLandingTime({ receiveAirborne = true,
+        rootCF = cf, velocity = velocity, floorY = floor, gravity = body.gravity }) or 0
+    -- Match Receiving.GetReceiveHitbox, including the transition at landing.
+    -- Use its exact oval, without inflating proximity into a predicted touch.
+    local groundBox = M.Hitboxes.ExtendToFeet(M.Hitboxes.Receive, humanoid, root)
+    local airBox = airborne and M.Hitboxes.ExtendToFeet(M.Hitboxes.AirReceive, humanoid, root) or nil
+    local initialBox = airBox or groundBox
+    actor = actor or M.Actors.GetFromCharacter(character)
+    local kicker = actor and finite(actor.UserId) and actor.UserId == f.lastKickerUserId
+    local leavingKicker = kicker and M.Hitboxes.ContainsPoint({ CFrame = cf }, initialBox, points[1].p)
+
+    -- Reject distant bodies before running native swept-oval intersection.
+    local reach = initialBox.Size.Magnitude * 0.5 + initialBox.CFrameOffset.Position.Magnitude
+    local endRoot = KeeperTiming.RootAt(body, limit).Position
+    local lowX, highX = math.min(cf.Position.X, endRoot.X) - reach, math.max(cf.Position.X, endRoot.X) + reach
+    local lowZ, highZ = math.min(cf.Position.Z, endRoot.Z) - reach, math.max(cf.Position.Z, endRoot.Z) + reach
+    local possible = false
+    for i = 2, #points do
+        local a, b = points[i - 1], points[i]
+        if a.t >= limit then break end
+        if math.max(a.p.X, b.p.X) >= lowX and math.min(a.p.X, b.p.X) <= highX
+            and math.max(a.p.Z, b.p.Z) >= lowZ and math.min(a.p.Z, b.p.Z) <= highZ then
+            possible = true; break
+        end
+    end
+    if not possible then return nil end
+
+    for i = 2, #points do
+        local left, right = points[i - 1], points[i]
+        if left.t >= limit then break end
+        local start, stop = left.t, math.min(limit, right.t)
+        while start < stop do
+            local inAir = airBox ~= nil and start < landing
+            local finish = inAir and math.min(stop, landing) or stop
+            local box = inAir and airBox or groundBox
+            local width = right.t - left.t
+            local a = left.p:Lerp(right.p, (start - left.t) / width)
+            local b = left.p:Lerp(right.p, (finish - left.t) / width)
+            local r0, r1 = KeeperTiming.RootAt(body, start), KeeperTiming.RootAt(body, finish)
+            if leavingKicker then
+                -- The ball leaving its shooter is not a future reception.
+                -- A later re-entry after it leaves the oval is still checked.
+                leavingKicker = M.Hitboxes.ContainsPoint({ CFrame = r1 }, box, b)
+            else
+                local alpha = M.Hitboxes.GetSegmentEnterAlpha({ CFrame = r1 }, box,
+                    a + r1.Position - r0.Position, b)
+                if finite(alpha) and alpha >= 0 and alpha <= 1 then
+                    local time = start + (finish - start) * alpha
+                    if time < limit and (not inAir or time < landing) then
+                        return { character = character, time = time }
+                    end
+                end
+            end
+            start = finish
+        end
+    end
+    return nil
+end
+
+function KeeperTiming.FindContact(f, plan, points)
+    local limit = math.min(KeeperTiming.ForecastSeconds,
+        plan.contact.time - KeeperTiming.ContactOrderMarginSeconds,
+        f.eta - Config.GoalMarginSeconds)
+    if limit <= 0 or M.Motion.GetContext(f.character) == nil then return nil end
+    local seen, best = {}, nil
+    local function add(character, actor)
+        if not character or character == f.character or seen[character] then return end
+        seen[character] = true
+        -- A missing/incompatible opponent rig cannot disable goalkeeper saves.
+        local ok, hit = pcall(KeeperTiming.PlayerContact, f, character, actor, points,
+            best and math.min(limit, best.time) or limit)
+        if ok and hit then best = hit
+        elseif not ok then
+            S.keeperTimingErrors = (S.keeperTimingErrors or 0) + 1
+            S.keeperTimingError = tostring(hit)
+        end
+    end
+    for _, player in ipairs(Players:GetPlayers()) do add(player.Character, player) end
+    local characters = workspace:FindFirstChild("Characters")
+    local function addChildren(container)
+        if not container then return end
+        for _, child in ipairs(container:GetChildren()) do
+            if child:IsA("Model") then add(child) end
+        end
+    end
+    addChildren(characters)
+    addChildren(characters and characters:FindFirstChild("Players"))
+    addChildren(characters and characters:FindFirstChild("NPCs"))
+    return best
+end
+
+function KeeperTiming.SameWindow(f, window)
+    return window and window.character == f.character and window.root == f.root
+        and window.ballId == f.ballId and window.flightKey == f.flightKey and window.world == f.world
+        and window.goal == f.context.goal and window.team == f.context.team
+        and sameTrajectory(window.trajectory, f.sourceTrajectory)
+end
+
+function KeeperTiming.Refine(f, immediate, points)
+    if not KeeperTiming.SameWindow(f, S.keeperWait) then S.keeperWait = nil end
+    S.keeperContact = nil
+    if not immediate or immediate.kind ~= "DIVE" or immediate.delay ~= 0 then return immediate end
+    local reserve = KeeperTiming.LaunchReserveSeconds
+    local clock = math.max(f.readClock, os.clock())
+    if f.eta <= KeeperTiming.UrgentGoalSeconds or immediate.contact.time <= reserve
+        or (S.keeperWait and clock >= S.keeperWait.deadline - KeeperTiming.MinimumWaitSeconds) then
+        return immediate
+    end
+    local hit = KeeperTiming.FindContact(f, immediate, points)
+    S.keeperContact = hit
+    if not hit then return immediate end
+
+    -- Compare actual native contact paths. Do not infer that reachability is
+    -- monotonic: curves and airborne contacts can have separate valid windows.
+    local latest, candidates = nil, {}
+    local minimumClearance = math.min(0.12, immediate.contact.clearance)
+    for _, delay in ipairs(KeeperTiming.Delays) do
+        if delay < f.eta - Config.GoalMarginSeconds - reserve then
+            S.delayedPlansChecked = (S.delayedPlansChecked or 0) + 1
+            local candidate = evaluateDive(f, "DIVE", delay, immediate.name, points)
+            if candidate and candidate.contact.clearance >= minimumClearance then
+                candidates[#candidates + 1] = candidate
+                latest = candidate
+            end
+        end
+    end
+    if not latest then return immediate end
+    local safeDelay = latest.delay - reserve
+    if S.keeperWait then safeDelay = math.min(safeDelay, S.keeperWait.deadline - f.readClock) end
+    if safeDelay <= KeeperTiming.MinimumWaitSeconds or safeDelay <= clock - f.readClock then return immediate end
+
+    -- Validate the reserved launch itself; an earlier launch is not necessarily
+    -- valid just because a later launch was. Fall back to another verified path.
+    S.delayedPlansChecked = (S.delayedPlansChecked or 0) + 1
+    local selected = evaluateDive(f, "DIVE", safeDelay, immediate.name, points)
+    if not selected or selected.contact.clearance < minimumClearance then
+        selected = nil
+        for i = #candidates, 1, -1 do
+            if candidates[i].delay <= safeDelay + 0.000001 then selected = candidates[i]; break end
+        end
+    end
+    if not selected or selected.delay <= KeeperTiming.MinimumWaitSeconds
+        or selected.delay <= clock - f.readClock then return immediate end
+
+    local deadline = f.readClock + selected.delay
+    if deadline <= os.clock() + KeeperTiming.MinimumWaitSeconds then return immediate end
+    if not S.keeperWait then
+        S.keeperWait = { character = f.character, root = f.root, ballId = f.ballId,
+            flightKey = f.flightKey, world = f.world, goal = f.context.goal, team = f.context.team,
+            trajectory = f.sourceTrajectory, deadline = deadline }
+        S.keeperWaits = (S.keeperWaits or 0) + 1
+    else
+        -- The deadline may tighten, but never slides later on repeated samples.
+        S.keeperWait.deadline = math.min(S.keeperWait.deadline, deadline)
+    end
+    selected.waitForContact = true
+    return selected
+end
+
+function KeeperTiming.Protect(f, plan, points)
+    local ok, result = pcall(KeeperTiming.Refine, f, plan, points)
+    if ok then return result end
+    S.keeperTimingErrors = (S.keeperTimingErrors or 0) + 1
+    S.keeperTimingError = tostring(result)
+    return plan
+end
+
 local function planSave(f)
     local began = os.clock()
 
@@ -2131,7 +2732,7 @@ local function planSave(f)
     end
 
     if #candidates > 0 then
-        return finish(choosePlan(candidates))
+        return finish(KeeperTiming.Protect(f, choosePlan(candidates), points))
     end
 
     local possible = {}
@@ -2798,6 +3399,22 @@ local function requestDive(f, plan)
         return false
     end
 
+    commit.contact = hit
+    local timed = KeeperTiming.Protect(fresh, commit, flight)
+    if timed.delay > 0 then
+        S.lastFrame = fresh
+        trackPlanWindow(fresh, timed)
+        S.nextPlanAt = plannerDeadline(fresh)
+        S.allowPositioning = true
+        status("TIMING DIVE " .. timed.name, "Rechecking receiver/blocker before committing")
+        return false
+    end
+    if os.clock() - fresh.readClock > 0.09 then
+        S.nextPlanAt = 0
+        status("REPLAN", "Final contact sample expired")
+        return false
+    end
+
     local exclusions = { fresh.character }
     local renderedBall = M.Renderer.GetBall()
 
@@ -3089,13 +3706,6 @@ local function position(f, dt)
         and remaining > 0
         and f.goalPosition ~= nil
 
-    -- In SIDES mode, do not pre-steer laterally while a shot threat is active.
-    -- This prevents an opposite-side correction (A/D) before the actual dive.
-    if Config.DiveFilter == "SIDES" and threat and not S.jump then
-        releaseMove(true)
-        return
-    end
-
     local coverage = f.isCoverage == true
 
     if coverage and not Config.PreShotCoverage then
@@ -3355,6 +3965,15 @@ connect(StateRemote.OnClientEvent, function(payload)
 
         if payload.BallId == M.Renderer.GetMatchBallId() then
             S.nextPlanAt = 0
+            local revision = payload.Kind == "Movement" and trajectoryStamp(payload.State) or nil
+            local identified = revision and (revision.movementSequence ~= nil
+                or revision.actionId ~= nil or revision.flightStartedAt ~= nil)
+            -- A rebased copy of the same server trajectory may wake the planner,
+            -- but must not restart its absolute launch deadline.
+            if not (identified and S.keeperWait and sameTrajectory(S.keeperWait.trajectory, revision)) then
+                S.keeperWait = nil
+                S.keeperContact = nil
+            end
         end
 
         return
@@ -4700,15 +5319,13 @@ end)
 
 -- STR: native aim input, bounded search, keeper and defender reach estimates.
 local function createStriker(d)
-    local A = { Enabled = false, AutoCurve = false, SmartRelease = false, FlickAssist = false, FlickSmoothness = 6, Ready = false, Status = "OFF", Detail = "", LastError = nil }
+    local A = { Enabled = false, AutoCurve = false, SmartRelease = false, Ready = false, Status = "OFF", Detail = "", LastError = nil }
     local C = { SliceMs = 2.5, CallsPerSlice = 4, Horizon = 2.2, Step = 0.035,
         SampleHz = 30, CandidateAge = 0.35, NetworkMargin = 0.10, EdgeMargin = 0.65, TargetSlack = 0.35,
         MaxAssistDistance = 55, ClearGapThreshold = 0.75, VolleyPrepareSeconds = 0.30,
-        ReleaseInterval = 0.05, ReleaseMargin = 0.35, ReleaseBudgetMs = 2.5,
-        FlickTriggerCharge = 0.80, FlickCenterThreshold = 0.22, FlickKeeperDeadzone = 0.70,
-        FlickMaxChecks = 5, FlickEdgeInset = 0.94, FlickFallbackInset = 0.82,
-        BestShotMaxChecks = 12, BestShotPrepareCharge = 0.45, BestShotSwitchCharge = 0.60 }
-    local stats = { shots = 0, assisted = 0, redirected = 0, flicks = 0, confirmed = 0, rejected = 0, candidates = 0, evaluations = 0,
+        BestShotRedirectStart = 0.60, BestShotRedirectFull = 0.72,
+        ReleaseInterval = 0.05, ReleaseMargin = 0.35, ReleaseBudgetMs = 2.5 }
+    local stats = { shots = 0, assisted = 0, redirected = 0, confirmed = 0, rejected = 0, candidates = 0, evaluations = 0,
         errors = 0, maxSliceMs = 0, maxAimMs = 0, lastCharge = 0, lastCurve = 0,
         releaseChecks = 0, releaseBudgetSkips = 0, releaseRequests = 0, autoReleases = 0, maxReleaseMs = 0 }
     local recentShots = {}
@@ -4828,7 +5445,7 @@ local function createStriker(d)
         local lateral = forward:Cross(UP)
         local depth = math.abs(forward:Dot(cf.RightVector)) * size.X / 2
             + math.abs(forward:Dot(cf.LookVector)) * size.Z / 2
-        return { center = goal.Position, plane = goal.Position + forward * depth,
+        return { center = goal.Position, plane = goal.Position + forward * depth, depth = depth * 2,
             forward = forward, lateral = lateral,
             halfWidth = (math.abs(lateral:Dot(cf.RightVector)) * size.X
                 + math.abs(lateral:Dot(cf.LookVector)) * size.Z) / 2,
@@ -5021,6 +5638,7 @@ local function createStriker(d)
         local curve = N.Curves.IsEnabled() and (session.curve or 0) or 0
         local keepers, defenders = keepersFor(ch, team, goal, practiceGoals)
         return { character = ch, root = root, origin = origin, velocity = velocity,
+            verticalSpeed = math.abs(root.AssemblyLinearVelocity.Y),
             sample = sample, goal = goal, goalCF = goal.CFrame, world = world, mouth = mouth,
             charge = approachingLock and maximum or charge, charges = charges,
             minimumCharge = minimum, maximumCharge = maximum,
@@ -5409,6 +6027,52 @@ local function createStriker(d)
         local width = math.clamp(math.abs((position - mouth.center):Dot(mouth.lateral)) / math.max(mouth.halfWidth, 0.01), 0, 1)
         return 0.20 * height * width
     end
+    local function crossbarMargin(f)
+        if not (f.volley or f.sample.IsAirborne) then return C.EdgeMargin end
+        -- Airborne carry/camera samples and the actual strike can land on different
+        -- update ticks. Reserve one aim-update interval of vertical travel, with
+        -- bounded extra headroom; do not lower ordinary grounded shot targets.
+        local dt = 1 / C.SampleHz
+        local motion = (f.verticalSpeed or 0) * dt + workspace.Gravity * dt * dt / 2
+        return C.EdgeMargin + math.clamp(C.TargetSlack + motion, C.TargetSlack, 1.5)
+    end
+    local function crossbarSweep(f, first, second)
+        -- Clip the swept segment to the frame vicinity. On approach only the
+        -- spherical cap overlaps the front plane: a steep descending volley can
+        -- strike the bar before its center reaches the otherwise-safe entry.
+        local mouth, radius = f.mouth, f.radius
+        local a = (first - mouth.plane):Dot(mouth.forward)
+        local b = (second - mouth.plane):Dot(mouth.forward)
+        local rear = -(math.min(mouth.depth or 0, 2 * radius) + radius)
+        local lo, hi = 0, 1
+        local delta = b - a
+        if math.abs(delta) < 1e-6 then
+            if a > radius or a < rear then return nil end
+        else
+            local frontT, rearT = (radius - a) / delta, (rear - a) / delta
+            lo, hi = math.max(0, math.min(frontT, rearT)), math.min(1, math.max(frontT, rearT))
+            if lo > hi then return nil end
+        end
+        local best
+        local function consider(t)
+            if t < lo or t > hi then return end
+            local p = first:Lerp(second, t)
+            local depth = math.max(0, a + delta * t)
+            local cap = math.sqrt(math.max(0, radius * radius - depth * depth))
+            local adjusted = Vector3.new(p.X, p.Y + cap - radius, p.Z)
+            if not best or adjusted.Y > best.Y then best = adjusted end
+        end
+        consider(lo); consider(hi)
+        if math.abs(delta) > 1e-6 then
+            consider(-a / delta)
+            local slope = (second.Y - first.Y) / delta
+            if slope > 0 then
+                local peakDepth = radius * slope / math.sqrt(1 + slope * slope)
+                consider((peakDepth - a) / delta)
+            end
+        end
+        return best
+    end
     local function validate(f, aim, charge, yielding)
         local velocity, spin = launch(f, aim, charge)
         if yielding then coroutine.yield() end
@@ -5421,11 +6085,13 @@ local function createStriker(d)
         local eta = time - launchAt
         if eta <= 0 or eta > C.Horizon then return nil end
         local mouth = f.mouth
+        local topLimit = mouth.top - f.radius - crossbarMargin(f)
         local edge = math.min(mouth.halfWidth - math.abs((position - mouth.center):Dot(mouth.lateral)), mouth.top - position.Y)
         -- Keep the whole ball inside the opening, not just its centre. The same
         -- check is used for current aim, searched candidates and smart release.
         if position.Y < mouth.bottom then return nil end
         if edge - f.radius < C.EdgeMargin then return nil, position end
+        if position.Y > topLimit then return nil, position end
         local minGap, minDemand, minDifficulty, previous = math.huge, math.huge, math.huge, f.origin
         local defenderReach, defenderRisk, previousT = math.huge, 0, 0
         local cursor = state
@@ -5437,6 +6103,8 @@ local function createStriker(d)
             cursor = d.M.Physics.GetStateAtTime(cursor, launchAt + t, f.world, {})
             if not cursor or not vec(cursor.Position) then return nil end
             if hasObstruction(f, cursor.BoundaryHits) then return nil end
+            local barPoint = crossbarSweep(f, previous, cursor.Position)
+            if barPoint and barPoint.Y > topLimit then return nil, barPoint end
             minGap = math.min(minGap, keeperGap(f, previous, cursor.Position, t))
             local demand, difficulty = reachDemand(f, previous, cursor.Position, t)
             minDemand, minDifficulty = math.min(minDemand, demand), math.min(minDifficulty, difficulty)
@@ -5451,6 +6119,36 @@ local function createStriker(d)
         edge = math.min(edge, mouth.halfWidth - math.abs((cursor.Position - mouth.center):Dot(mouth.lateral)),
             mouth.top - cursor.Position.Y)
         if edge - f.radius < C.EdgeMargin then return nil, cursor.Position end
+        if cursor.Position.Y > topLimit then return nil, cursor.Position end
+        -- FirstBoxEntry reports the center entering the scoring volume. The ball
+        -- can still rise into the bar or bend into a post immediately afterward.
+        -- Follow it through the mouth (at most one ball diameter of goal depth)
+        -- until its trailing edge clears. Do not simulate on to the back net.
+        local clearanceDepth = math.min(mouth.depth or 0, 2 * f.radius) + f.radius
+        local passageTime = eta
+        for _ = 1, 8 do
+            local remaining = (cursor.Position - mouth.plane):Dot(mouth.forward) + clearanceDepth
+            if remaining <= 1e-4 then break end
+            local motion = vec(cursor.Velocity) and cursor.Velocity or velocity
+            local inward = -motion:Dot(mouth.forward)
+            if inward <= 1e-4 then return nil end
+            local dt = math.min(C.Step, math.max(0.001, remaining / inward))
+            passageTime += dt
+            local passageStart = cursor.Position
+            cursor = d.M.Physics.GetStateAtTime(cursor, launchAt + passageTime, f.world, {})
+            if not cursor or not vec(cursor.Position) then return nil end
+            if hasObstruction(f, cursor.BoundaryHits) then
+                -- Use the unreflected flight only as a repair hint. The repaired
+                -- direction must pass the complete native collision check again.
+                return nil, d.M.Physics.GetAirFlight(f.origin, velocity, spin, passageTime)
+            end
+            -- Do not depend on the preview world including the crossbar solid.
+            -- A rising volley must stay below it throughout the frame passage,
+            -- not merely at the first center-entry sample.
+            local barPoint = crossbarSweep(f, passageStart, cursor.Position)
+            if barPoint and barPoint.Y > topLimit then return nil, barPoint end
+        end
+        if (cursor.Position - mouth.plane):Dot(mouth.forward) + clearanceDepth > 1e-4 then return nil end
         if #f.keepers == 0 then minGap, minDemand, minDifficulty = nil, nil, nil end
         return { gap = minGap, reachDemand = minDemand, difficulty = minDifficulty, predictionCharge = charge,
             score = (minDifficulty and (minDifficulty - 1) * d.M.Dive.Constants.Distance or 0)
@@ -5533,11 +6231,12 @@ local function createStriker(d)
         -- two-proposal limit. This approximation never authorizes an aim by itself.
         local mouth = f.mouth
         local inset = f.radius + C.EdgeMargin + C.TargetSlack
+        local topInset = f.radius + crossbarMargin(f) + C.TargetSlack
         local half = mouth.halfWidth - inset
-        if half <= 0 or mouth.top - inset <= mouth.bottom + f.radius then return nil end
+        if half <= 0 or mouth.top - topInset <= mouth.bottom + f.radius then return nil end
         local x = (position - mouth.center):Dot(mouth.lateral)
         local shift = mouth.lateral * (math.clamp(x, -half, half) - x)
-            + UP * math.min(0, mouth.top - inset - position.Y)
+            + UP * math.min(0, mouth.top - topInset - position.Y)
         local origin = f.sample.Origin + (f.aimOffset or V0)
         local distance = (origin - mouth.plane):Dot(mouth.forward)
         local ballDistance = (f.origin - mouth.plane):Dot(mouth.forward)
@@ -5552,11 +6251,16 @@ local function createStriker(d)
         local point = mouth.center + mouth.lateral * target.X
         return Vector3.new(point.X, target.Y, point.Z)
     end
-    -- Best Shot Assist: hard far-side policy. A target is only eligible when it
-    -- is clearly on the side opposite the goalkeeper; center/keeper-head targets
-    -- are never used as a fallback.
+    local function shotZone(mouth, point)
+        local x = (point - mouth.center):Dot(mouth.lateral)
+        local height = (point.Y - mouth.bottom) / math.max(mouth.top - mouth.bottom, 0.01)
+        local level = height < 1 / 3 and "LOW" or (height > 2 / 3 and "HIGH" or "MID")
+        -- mouth.lateral points left when looking into the goal.
+        local side = x > mouth.halfWidth / 3 and "LEFT" or (x < -mouth.halfWidth / 3 and "RIGHT" or "CENTER")
+        return level .. " " .. side
+    end
     local function preferredShotSide(f)
-        if not f or not f.mouth or not f.keepers or #f.keepers == 0 then return 0 end
+        if not f or not f.mouth or #f.keepers == 0 then return 1 end
         local weighted, total = 0, 0
         for _, keeper in ipairs(f.keepers) do
             local x = (keeper.position - f.mouth.center):Dot(f.mouth.lateral)
@@ -5569,11 +6273,12 @@ local function createStriker(d)
         if bias > deadzone then return -1 end
         if bias < -deadzone then return 1 end
 
-        -- Centered keeper: compare modeled reach at the two far-side points.
+        -- If the keeper is centered, compare the two outer lanes by the
+        -- existing reach model. This does not run a new trajectory solve.
         local inset = f.radius + C.EdgeMargin + C.TargetSlack
         local half = math.max(0, f.mouth.halfWidth - inset)
         local low = f.mouth.bottom + f.radius + 0.4
-        local high = f.mouth.top - inset
+        local high = f.mouth.top - f.radius - crossbarMargin(f) - C.TargetSlack
         if half > 0 and high > low then
             local y = low + (high - low) * 0.55
             local left = targetPoint(f.mouth, Vector2.new(half * 0.72, y))
@@ -5589,23 +6294,19 @@ local function createStriker(d)
     end
 
     local function bestShotTargetAllowed(f, rating, side)
-        if not f or not rating or not vec(rating.position) or side == 0 then return false end
+        if not f or not rating or not rating.position or side == 0 then return false end
         local half = math.max(f.mouth.halfWidth, 0.01)
         local x = (rating.position - f.mouth.center):Dot(f.mouth.lateral)
-        -- Hard center exclusion: never accept a target near the keeper's lane.
+        -- Never accept the centre lane or the keeper's side.
         if x * side < half * 0.34 then return false end
 
         local nearestKeeper = math.huge
         for _, keeper in ipairs(f.keepers or {}) do
             local kx = (keeper.position - f.mouth.center):Dot(f.mouth.lateral)
-            local lateralGap = math.abs(x - kx)
-            nearestKeeper = math.min(nearestKeeper, lateralGap)
+            nearestKeeper = math.min(nearestKeeper, math.abs(x - kx))
         end
-        -- Require a substantial lateral separation from every tracked keeper.
         if nearestKeeper < half * 0.30 then return false end
 
-        -- Do not accept a point directly above the keeper while it remains in the
-        -- same lateral lane. High corners on the far side are still allowed.
         for _, keeper in ipairs(f.keepers or {}) do
             local kx = (keeper.position - f.mouth.center):Dot(f.mouth.lateral)
             if math.abs(x - kx) < half * 0.42
@@ -5616,158 +6317,25 @@ local function createStriker(d)
         return true
     end
 
-    local function shotZone(mouth, point)
-        local x = (point - mouth.center):Dot(mouth.lateral)
-        local height = (point.Y - mouth.bottom) / math.max(mouth.top - mouth.bottom, 0.01)
-        local level = height < 1 / 3 and "LOW" or (height > 2 / 3 and "HIGH" or "MID")
-        -- mouth.lateral points left when looking into the goal.
-        local side = x > mouth.halfWidth / 3 and "LEFT" or (x < -mouth.halfWidth / 3 and "RIGHT" or "CENTER")
-        return level .. " " .. side
-    end
-    -- Flick Assist uses the same physical goal plane as Shoot Assist. The player's
-    -- current ray is classified first; only then do we choose the opposite lane.
-    -- Flick starts only when the native charge reaches 80%. Higher smoothness
-    -- spreads the direction transition over a larger part of the final charge.
-    local function flickBlendAlpha(f)
-        if not A.FlickAssist or not f or f.volley then return 0 end
-        local maximum = math.max(f.maximumCharge or 0, 1e-4)
-        local progress = math.clamp((f.elapsed or 0) / maximum, 0, 1)
-        if progress < C.FlickTriggerCharge then return 0 end
-        local smoothness = math.clamp(math.floor(tonumber(A.FlickSmoothness) or 6), 1, 10)
-        local window = 0.035 + (smoothness - 1) * 0.018
-        local t = math.clamp((progress - C.FlickTriggerCharge) / window, 0, 1)
-        -- Smoothstep keeps the first movement gentle and finishes decisively.
-        return t * t * (3 - 2 * t)
-    end
-
-    local function flickAimSide(f, sample)
-        if not A.FlickAssist or not f or not f.mouth or typeof(sample) ~= "table"
-            or not vec(sample.Origin) or not vec(sample.Direction) then return 0 end
-        local origin = sample.Origin + (f.aimOffset or V0)
-        local denominator = sample.Direction:Dot(f.mouth.forward)
-        if math.abs(denominator) < 1e-5 then return 0 end
-        local distance = (f.mouth.plane - origin):Dot(f.mouth.forward) / denominator
-        if distance <= 0 then return 0 end
-        local point = origin + sample.Direction * distance
-        local x = (point - f.mouth.center):Dot(f.mouth.lateral)
-        local threshold = f.mouth.halfWidth * C.FlickCenterThreshold
-        if x > threshold then return 1 end -- LEFT
-        if x < -threshold then return -1 end -- RIGHT
-        return 0 -- CENTER
-    end
-
-    -- For a center aim, inspect the actual keeper snapshots already collected by
-    -- Shoot Assist. Positive means the keeper is left of the goal center.
-    local function keeperBias(f)
-        -- First use the same reach-demand model used to score Shoot Assist targets.
-        -- Higher difficulty means the keeper needs more of its reachable envelope.
-        local inset = f.radius + C.EdgeMargin + C.TargetSlack
-        local half = math.max(0, f.mouth.halfWidth - inset)
-        local low = f.mouth.bottom + f.radius + 0.4
-        local high = f.mouth.top - inset
-        if half > 0 and high > low then
-            local y = (low + high) * 0.5
-            local leftPoint = targetPoint(f.mouth, Vector2.new(half * 0.72, y))
-            local rightPoint = targetPoint(f.mouth, Vector2.new(-half * 0.72, y))
-            local speed = (N.Shoot.Constants.Shot and N.Shoot.Constants.Shot.MaximumSpeed) or 123
-            local leftEta = (leftPoint - f.origin).Magnitude / math.max(speed, 1)
-            local rightEta = (rightPoint - f.origin).Magnitude / math.max(speed, 1)
-            local _, leftDifficulty = reachDemand(f, leftPoint, leftPoint, leftEta)
-            local _, rightDifficulty = reachDemand(f, rightPoint, rightPoint, rightEta)
-            if leftDifficulty and rightDifficulty
-                and math.abs(leftDifficulty - rightDifficulty) > 0.08 then
-                return leftDifficulty > rightDifficulty and 1 or -1
-            end
-        end
-
-        -- Fallback for a temporarily incomplete reach profile: use keeper location.
-        local left, right = 0, 0
-        for _, keeper in ipairs(f.keepers or {}) do
-            local x = (keeper.position - f.mouth.center):Dot(f.mouth.lateral)
-            if x > C.FlickKeeperDeadzone then
-                left += 1 + math.min(1, math.abs(x) / math.max(f.mouth.halfWidth, 0.01))
-            elseif x < -C.FlickKeeperDeadzone then
-                right += 1 + math.min(1, math.abs(x) / math.max(f.mouth.halfWidth, 0.01))
-            end
-        end
-        if left > right + 0.25 then return -1 end
-        if right > left + 0.25 then return 1 end
-        return 0
-    end
-
-    local function flickTargetSide(f, sample)
-        local aimed = flickAimSide(f, sample)
-        if aimed ~= 0 then return -aimed end
-        -- Center: use keeper location first. If the keeper is centered/equidistant,
-        -- randomize between the two sides; both choices still require rate() validation.
-        local biased = keeperBias(f)
-        if biased ~= 0 then return biased end
-        return math.random(0, 1) == 0 and -1 or 1
-    end
-
-    local function candidateSide(f, candidate)
-        if not f or not candidate or not candidate.rating or not vec(candidate.rating.position) then return 0 end
-        local x = (candidate.rating.position - f.mouth.center):Dot(f.mouth.lateral)
-        local threshold = f.mouth.halfWidth * C.FlickCenterThreshold
-        if x > threshold then return 1 end
-        if x < -threshold then return -1 end
-        return 0
-    end
-
-    -- Build a fresh aim directly on the requested flick lane. This is the
-    -- anti-stuck path: if cached candidates do not contain the opposite side,
-    -- we generate a few fresh edge targets instead of returning the original aim.
-    local function directFlickAim(f, flickSide, xInset, yRatio)
-        if not f or flickSide == 0 or not f.mouth then return nil end
-        local inset = f.radius + C.EdgeMargin + C.TargetSlack
-        local half = f.mouth.halfWidth - inset
-        local low = f.mouth.bottom + f.radius + 0.4
-        local high = f.mouth.top - inset
-        if half <= 0 or high <= low then return nil end
-        local x = half * math.clamp(xInset or C.FlickEdgeInset, 0.55, 0.98) * flickSide
-        local y = low + (high - low) * math.clamp(yRatio or 0.72, 0.20, 0.90)
-        local center = f.mouth.center + f.mouth.lateral * x
-        local point = Vector3.new(center.X, y, center.Z)
-        local origin = f.sample.Origin + (f.aimOffset or V0)
-        local direction = point - origin
-        if not vec(direction) or direction.Magnitude < 1e-5 then return nil end
-        local yaw, pitch = angles(direction.Unit)
-        return aimAt(f, yaw, pitch), point
-    end
-
-    -- Flick targets should not merely cross the goal center. Prefer the far
-    -- post/corner of the selected side, while still letting rate() reject it
-    -- if the route is actually unsafe. This makes the flick finish farther
-    -- from the keeper's reachable envelope instead of stopping near the middle.
-    local function flickEdgeScore(f, candidate, flickSide)
-        if not f or not candidate or not candidate.rating or not vec(candidate.rating.position)
-            or flickSide == 0 then return -math.huge end
-        local offset = candidate.rating.position - f.mouth.center
-        local x = offset:Dot(f.mouth.lateral)
-        local y = offset:Dot(f.mouth.up)
-        local half = math.max(f.mouth.halfWidth, 0.01)
-        local height = math.max(f.mouth.top - f.mouth.bottom, 0.01)
-        local sideAmount = math.clamp((x * flickSide) / half, -1, 1)
-        local heightAmount = math.clamp((y - f.mouth.bottom) / height, 0, 1)
-        -- Side distance is the main goal; a modest high-corner bonus helps
-        -- avoid selecting a reachable mid-height point when the corner exists.
-        return sideAmount * 2.0 + heightAmount * 0.35
-    end
     local function searchTargets(f)
         local mouth = f.mouth
         -- Leave room for the iterative solver's 0.30-stud target tolerance.
         local inset = f.radius + C.EdgeMargin + C.TargetSlack
         local half = mouth.halfWidth - inset
         local low = mouth.bottom + f.radius + 0.4
-        local high = mouth.top - inset
+        local high = mouth.top - f.radius - crossbarMargin(f) - C.TargetSlack
         if half <= 0 or high <= low then return {} end
         local middle = (low + high) / 2
         local targets = {}
-        -- Cover all nine height/side combinations, plus the lanes between center and posts.
-        -- Use a cheap reach estimate only to order work; it never authorizes an aim change.
+        local side = preferredShotSide(f)
+        local farX = half * side
+        local nearX = half * 0.72 * side
+        -- Best Shot Assist searches only the far-side lanes. Centre and the
+        -- keeper-side lanes are intentionally excluded.
+        local xLanes = { farX, nearX }
         local speed = (N.Shoot.Constants.Shot and N.Shoot.Constants.Shot.MaximumSpeed) or 123
         for level, height in ipairs({ middle, high, low }) do
-            for _, x in ipairs({ -half, half, 0, -half * 0.5, half * 0.5 }) do
+            for _, x in ipairs(xLanes) do
                 local target = Vector2.new(x, height)
                 local point = targetPoint(mouth, target)
                 local eta = (point - f.origin).Magnitude / math.max(speed, 1)
@@ -5811,7 +6379,14 @@ local function createStriker(d)
             local function retain(atPower, lane, aim)
                 local retained = false
                 if aim then
-                    local rating = rate(atPower, aim, true)
+                    local rating, edgePosition = rate(atPower, aim, true)
+                    if not rating and edgePosition then
+                        local corrected = insetAim(atPower, aim, edgePosition)
+                        if corrected then
+                            rating = rate(atPower, corrected, true)
+                            if rating then aim = corrected end
+                        end
+                    end
                     stats.candidates += 1
                     owner.candidateEvaluations = (owner.candidateEvaluations or 0) + 1
                     if rating and session == owner and A.Enabled then
@@ -5868,23 +6443,20 @@ local function createStriker(d)
             end
             -- Compare straight and both bends at each upper corner before spending
             -- time on more low variants. Each bend gets its own ballistic solve.
-            for index = 1, math.min(2, #targets) do
-                local entry = targets[index]
-                local at = table.clone(solveFrame); at.curve = f.curve
-                seeds[at.curve] = seeds[at.curve] or {}
-                prepare(at, entry, seeds[at.curve])
-            end
+            local curves, seenCurves = { f.curve }, { [f.curve] = true }
             if f.autoCurve then
-                local curves, seenCurves = {}, { [f.curve] = true }
                 for _, curve in ipairs({ -1, 1, 0 }) do
                     if not seenCurves[curve] then curves[#curves + 1] = curve; seenCurves[curve] = true end
                 end
+            end
+            -- The exposed corner gets all three routes first, so a short charge
+            -- can compare a bend with its straight rival before solving the
+            -- keeper's covered corner. Target priority includes keeper reach.
+            for index = 1, math.min(2, #targets) do
                 for _, curve in ipairs(curves) do
-                    for index = 1, math.min(2, #targets) do
-                        local at = table.clone(solveFrame); at.curve = curve
-                        seeds[curve] = seeds[curve] or {}
-                        prepare(at, targets[index], seeds[curve])
-                    end
+                    local at = table.clone(solveFrame); at.curve = curve
+                    seeds[curve] = seeds[curve] or {}
+                    prepare(at, targets[index], seeds[curve])
                 end
             end
             -- A lower bend can be harder when the keeper is well off-center. Give
@@ -5911,8 +6483,8 @@ local function createStriker(d)
             for index, entry in ipairs(targets) do
                 -- Rotate curve variants through later height solves within the same
                 -- coroutine budget. With auto curve off, this is the original search.
-                local curves = f.autoCurve and { f.curve, -1, 1, 0 } or { f.curve }
-                local curve = curves[(index - 1) % #curves + 1]
+                local curveVariants = f.autoCurve and { f.curve, -1, 1, 0 } or { f.curve }
+                local curve = curveVariants[(index - 1) % #curveVariants + 1]
                 local candidateFrame = table.clone(solveFrame); candidateFrame.curve = curve
                 seeds[curve] = seeds[curve] or {}
                 if index > 2 and entry ~= middlePrepared then prepare(candidateFrame, entry, seeds[curve]) end
@@ -5960,15 +6532,10 @@ local function createStriker(d)
     local function choose(sample)
         local owner = session
         if not owner or owner.locked then return sample end
-        local previousFlickSide = owner.flickSide or 0
         owner.pair = nil
         owner.reason = nil
         owner.bestGap = nil
         owner.redirected = false
-        owner.flicked = false
-        owner.flickSide = 0
-        owner.flickAlpha = 0
-        owner.flickDirect = false
         owner.decisionAudit = nil
         owner.completedAlternatives, owner.checkedAlternatives = 0, 0
         local f = frame(sample)
@@ -5988,35 +6555,17 @@ local function createStriker(d)
             setStatus("NO GK DATA", "Normal aim | Keeper reach is unknown")
             return sample
         end
-        local normal = rate(f, sample, false)
-        owner.rawRating = normal
-        local flickAlpha = flickBlendAlpha(f)
-        local flickSide = flickAlpha > 0
-            and (previousFlickSide ~= 0 and previousFlickSide or flickTargetSide(f, sample))
-            or 0
-        owner.flickSide = flickSide
-        owner.flickAlpha = flickAlpha
-        owner.flickActive = A.FlickAssist and flickSide ~= 0 and flickAlpha > 0
         local bestShotSide = preferredShotSide(f)
-        owner.bestShotSide = bestShotSide
-        -- Prepare far-side candidates before the actual redirect window.
-        -- This prevents the 60% switch from happening before the validated
-        -- far-side route has finished solving.
-        -- Best Shot timing is percentage-based, not raw seconds.
-        -- This keeps 45%/60% consistent across different native charge lengths.
-        local bestShotPrepareCharge = math.clamp(C.BestShotPrepareCharge or 0.45, 0, 0.90)
-        local bestShotSwitchCharge = math.clamp(C.BestShotSwitchCharge or 0.60, 0, 0.95)
-        local maximumCharge = math.max(f.maximumCharge or 0, 1e-4)
-        local bestShotProgress = math.clamp((f.charge or 0) / maximumCharge, 0, 1)
-        local bestShotPreparing = bestShotProgress >= bestShotPrepareCharge
-        local bestShotReady = bestShotProgress >= bestShotSwitchCharge
-        owner.bestShotPreparing = bestShotPreparing
-        owner.bestShotReady = bestShotReady
-        -- Before 60%, never disturb the player's original aim. At/after 60%,
-        -- only replace it after a far-side candidate has been freshly validated.
-        if normal and not owner.flickActive and bestShotReady
-            and not bestShotTargetAllowed(f, normal, bestShotSide) then
+        local normal = rate(f, sample, false)
+        if normal and not bestShotTargetAllowed(f, normal, bestShotSide) then
             normal = nil
+        end
+        owner.rawRating = normal
+        owner.bestShotSide = bestShotSide
+        if f.charge < C.BestShotRedirectStart then
+            owner.applied, owner.rating, owner.reason = false, nil, "prepare"
+            setStatus("PREPARING BEST SHOT", "Far-side redirect starts at 60% charge")
+            return sample
         end
         local audit = { scope = "current aim and freshly checked proposals", checked = {}, duplicatesSkipped = 0,
             rawScore = normal and normal.score, rawDefenderRisk = normal and normal.defenderRisk,
@@ -6052,48 +6601,62 @@ local function createStriker(d)
                 owner.validationStage = stage
                 -- Native curve strength changes with charge. Revisit the strongest
                 -- full-power proposals when entering the lock/volley window, then
-                -- validate several independent lanes so Best Shot Assist cannot get
-                -- stuck on the original aim merely because the first two proposals
-                -- were stale, blocked, or from the same side.
+                -- continue the existing fair rotation with the same two-check limit.
                 for _, entry in ipairs(owner.candidates) do entry.checkedAt = nil end
             end
         end
         -- Recheck a completed candidate using current power, launch position and keeper state.
         -- Invalid/stale work never supplies a direction to native shooting.
         local checked, seenAims = 0, {}
-        local maxChecks = owner.flickActive and math.max(3, C.FlickMaxChecks) or math.max(4, C.BestShotMaxChecks or 6)
         local shortlist = table.clone(owner.candidates)
         -- Preserve the chosen route even if the bounded search pool evicts its seed.
         -- It is a proposal only: revalidate it below with current power/world/keeper data.
         local incumbent = choice and choice.candidate or owner.selectedCandidate
         if incumbent then table.insert(shortlist, 1, incumbent) end
         owner.validationPass = (owner.validationPass or 0) + 1
-        local prioritizeBest = owner.validationPass % 2 == 0
-        table.sort(shortlist, function(a, b)
-            if flickSide ~= 0 then
-                local as = candidateSide(f, a) == flickSide
-                local bs = candidateSide(f, b) == flickSide
-                if as ~= bs then return as end
-                if as and bs then
-                    -- For a flick, edge/corner placement outranks a merely opposite-side
-                    -- point. Physics validation below still has the final say.
-                    local ae = flickEdgeScore(f, a, flickSide)
-                    local be = flickEdgeScore(f, b, flickSide)
-                    if math.abs(ae - be) > 0.08 then return ae > be end
+        local priorities = {}
+        local keeperMoved = false
+        for _, entry in ipairs(shortlist) do
+            local previous = entry.frame and entry.frame.keepers
+            local changed = not previous or #previous ~= #f.keepers
+            for i, keeper in ipairs(f.keepers) do
+                local old = previous and previous[i]
+                if not old or old.character ~= keeper.character or old.position ~= keeper.position
+                    or old.velocity ~= keeper.velocity or old.speed ~= keeper.speed or old.jump ~= keeper.jump
+                    or old.upright ~= keeper.upright then
+                    changed = true; break
                 end
             end
-            -- Revalidate the previous winner, then fairly visit alternatives. A bounded
-            -- multi-lane pass prevents two stale top-ranked proposals from hiding
-            -- every other lane until aim lock.
+            local rating = entry.rating
+            if changed and previous and #previous > 0 and rating and rating.position and rating.eta then
+                -- Refresh ordering after keeper movement without rerunning every trajectory.
+                -- Preserve each route's flight score, adjusting its endpoint reach estimate.
+                -- This is only a proposal priority; the full current flight is checked below.
+                local before = table.clone(f); before.keepers = previous; before.reachProfiles = nil
+                local _, oldDemand = reachDemand(before, rating.position, rating.position, rating.eta)
+                local _, newDemand = reachDemand(f, rating.position, rating.position, rating.eta)
+                local priority = table.clone(rating)
+                priority.score += (newDemand - oldDemand) * d.M.Dive.Constants.Distance
+                priorities[entry] = priority
+                keeperMoved = true
+            elseif entry.checkedStage == owner.validationStage then
+                priorities[entry] = entry.checkedRating or false
+            else
+                priorities[entry] = rating
+            end
+        end
+        -- Changed coverage needs a fresh rival now; stationary scenes retain fair rotation.
+        local prioritizeBest = keeperMoved or owner.validationPass % 2 == 0
+        table.sort(shortlist, function(a, b)
+            -- Revalidate the previous winner, then fairly visit alternatives. Two stale
+            -- top-ranked proposals must not hide every other lane until aim lock.
             local incumbent = choice and choice.candidate or owner.selectedCandidate
             if a == incumbent then return b ~= incumbent end
             if b == incumbent then return false end
             -- Alternate strength and age: refresh a strong finished corner promptly,
             -- while stale or invalid leaders cannot permanently hide other lanes.
             if prioritizeBest then
-                local ar, br = a.rating, b.rating
-                if a.checkedStage == owner.validationStage then ar = a.checkedRating end
-                if b.checkedStage == owner.validationStage then br = b.checkedRating end
+                local ar, br = priorities[a], priorities[b]
                 if betterRating(ar, br) then return true end
                 if betterRating(br, ar) then return false end
             end
@@ -6104,37 +6667,13 @@ local function createStriker(d)
             if math.abs(ad - bd) > 1e-5 then return ad < bd end
             return betterRating(a.rating, b.rating)
         end)
-        -- After ranking, deliberately pull one fresh representative from each
-        -- horizontal lane into the front of the bounded validation pass. This is
-        -- what prevents a strong-looking left candidate from consuming every
-        -- validation slot while the right side is never physically checked.
-        if flickSide == 0 and #shortlist > 1 then
-            local lanes, laneSeen = {}, {}
-            local function laneOf(entry)
-                local side = candidateSide(f, entry)
-                return side == 0 and 0 or side
-            end
-            for _, preferredLane in ipairs({ -1, 1, 0 }) do
-                for _, entry in ipairs(shortlist) do
-                    if not laneSeen[entry] and laneOf(entry) == preferredLane then
-                        lanes[#lanes + 1] = entry
-                        laneSeen[entry] = true
-                        break
-                    end
-                end
-            end
-            for _, entry in ipairs(shortlist) do
-                if not laneSeen[entry] then lanes[#lanes + 1] = entry end
-            end
-            shortlist = lanes
-        end
         for _, entry in ipairs(shortlist) do
-            local wantedLane = flickSide ~= 0
-                and candidateSide(f, entry) == flickSide
-                or (bestShotReady and bestShotTargetAllowed(f, entry.rating, bestShotSide))
-            if wantedLane and (requiredCurve == nil or entry.curve == requiredCurve)
+            if (requiredCurve == nil or entry.curve == requiredCurve)
                 and compatible(entry.frame, f) and clock - entry.at <= C.CandidateAge then
                 local aim = candidateAim(entry, f)
+                if not bestShotTargetAllowed(f, entry.rating, bestShotSide) then
+                    continue
+                end
                 local candidateFrame = f
                 if f.autoCurve and entry.curve ~= nil then
                     candidateFrame = table.clone(f); candidateFrame.curve = entry.curve
@@ -6163,7 +6702,7 @@ local function createStriker(d)
                     checkedAt = entry.checkedAt }
                 local rating, edgePosition = rate(candidateFrame, aim, false)
                 local correctedEdge = false
-                if not rating and edgePosition and checked < maxChecks then
+                if not rating and edgePosition and checked < 2 then
                     local corrected = insetAim(candidateFrame, aim, edgePosition)
                     if corrected then
                         checked += 1
@@ -6187,142 +6726,19 @@ local function createStriker(d)
                 if betterRating(rating, best) then
                     chosen, best, selectedCandidate, selectedCurve = aim, rating, entry, candidateFrame.curve
                 end
-                if checked >= maxChecks then break end
+                if checked >= 2 then break end
             end
         end
-        -- Once the redirect window is reached, validate a small deterministic
-        -- far-side set immediately. This is independent of the background solver,
-        -- so a slow/stale candidate queue cannot make Best Shot appear inactive.
-        if not chosen and not owner.flickActive and bestShotReady and bestShotSide ~= 0 then
-            local inset = f.radius + C.EdgeMargin + C.TargetSlack
-            local half = f.mouth.halfWidth - inset
-            local low = f.mouth.bottom + f.radius + 0.4
-            local high = f.mouth.top - inset
-            if half > 0 and high > low then
-                -- Try several heights on the far side. The target itself is checked
-                -- against the keeper before rate(); rate() then only decides whether
-                -- the actual shot physics can reach that target.
-                local bestDirect, bestDirectRating
-                for _, spec in ipairs({
-                    { x = 0.90, y = 0.70 },
-                    { x = 0.78, y = 0.52 },
-                    { x = 0.64, y = 0.35 },
-                    { x = 0.92, y = 0.88 },
-                }) do
-                    local point = targetPoint(f.mouth, Vector2.new(half * spec.x * bestShotSide, low + (high - low) * spec.y))
-                    local pointSide = (point - f.mouth.center):Dot(f.mouth.lateral)
-                    local targetAllowed = pointSide * bestShotSide >= f.mouth.halfWidth * 0.34
-                    if targetAllowed then
-                        local origin = f.sample.Origin + (f.aimOffset or V0)
-                        local direction = point - origin
-                        if vec(direction) and direction.Magnitude > 1e-5 then
-                            local yaw, pitch = angles(direction.Unit)
-                            local aim = aimAt(f, yaw, pitch)
-                            local rating = rate(f, aim, false)
-                            owner.validationSequence = (owner.validationSequence or 0) + 1
-                            audit.checked[#audit.checked + 1] = { valid = rating ~= nil, directBestShot = true,
-                                score = rating and rating.score, defenderRisk = rating and rating.defenderRisk,
-                                gap = rating and rating.gap, flightSeconds = rating and rating.eta, targetSide = bestShotSide }
-                            if rating and (not bestDirectRating or betterRating(rating, bestDirectRating)) then
-                                bestDirect, bestDirectRating = aim, rating
-                            end
-                        end
-                    end
-                end
-                if bestDirect and bestDirectRating then
-                    chosen, best, selectedCandidate, selectedCurve = bestDirect, bestDirectRating, nil, f.curve
-                end
-            end
-        end
-
         -- A valid current aim is also a candidate, including while alternatives are still solving.
         -- Retain it under the same scoped correction guard instead of giving it back to another aim helper.
-        local confirmed = not owner.flickActive and normal and (requiredCurve == nil or f.curve == requiredCurve)
-            and (not bestShotReady or bestShotTargetAllowed(f, normal, bestShotSide))
+        local confirmed = normal and (requiredCurve == nil or f.curve == requiredCurve)
             and not betterRating(best, normal)
         if confirmed then chosen, best, selectedCandidate, selectedCurve = table.clone(sample), normal, nil, f.curve end
-        -- If Flick Assist is active, never silently replace a valid opposite-side
-        -- solution with the user's original direction. Only fall back when the
-        -- requested side has no valid candidate at all.
-        if owner.flickActive and not chosen then
-            -- Cached candidates can all be stale or belong to the original lane.
-            -- Generate fresh opposite-side edge shots now, and validate each one.
-            -- This is deliberately bounded so the release path stays responsive.
-            local fallbackTargets = {
-                { inset = C.FlickEdgeInset, y = 0.72 },
-                { inset = C.FlickFallbackInset, y = 0.58 },
-                { inset = 0.68, y = 0.78 },
-                { inset = 0.78, y = 0.38 },
-            }
-            for _, targetSpec in ipairs(fallbackTargets) do
-                if not chosen then
-                    local aim = directFlickAim(f, flickSide, targetSpec.inset, targetSpec.y)
-                    if aim then
-                        local candidateFrame = f
-                        if f.autoCurve and requiredCurve ~= nil then
-                            candidateFrame = table.clone(f)
-                            candidateFrame.curve = requiredCurve
-                        end
-                        local rating = rate(candidateFrame, aim, false)
-                        owner.validationSequence = (owner.validationSequence or 0) + 1
-                        audit.checked[#audit.checked + 1] = { valid = rating ~= nil, directFlick = true,
-                            score = rating and rating.score, defenderRisk = rating and rating.defenderRisk,
-                            gap = rating and rating.gap, flightSeconds = rating and rating.eta }
-                        if rating then
-                            chosen, best, selectedCandidate, selectedCurve = aim, rating, nil, candidateFrame.curve
-                            owner.flickDirect = true
-                            break
-                        end
-                    end
-                end
-            end
-            if not chosen then
-                owner.flickFallback = true
-                if normal and (requiredCurve == nil or f.curve == requiredCurve) then
-                    chosen, best, selectedCandidate, selectedCurve = table.clone(sample), normal, nil, f.curve
-                end
-            else
-                owner.flickFallback = false
-            end
-        else
-            owner.flickFallback = false
-        end
-        -- If the cached search did not produce a far-side candidate, create a
-        -- small deterministic far-side set now. These are still passed through
-        -- rate(), so no blind target is applied.
-        if not chosen and not owner.flickActive and bestShotReady then
-            local inset = f.radius + C.EdgeMargin + C.TargetSlack
-            local half = f.mouth.halfWidth - inset
-            local low = f.mouth.bottom + f.radius + 0.4
-            local high = f.mouth.top - inset
-            if half > 0 and high > low then
-                local targets = { 0.72, 0.52, 0.32 }
-                for _, ratio in ipairs(targets) do
-                    if not chosen then
-                        local x = half * ratio * bestShotSide
-                        local y = low + (high - low) * ratio
-                        local point = targetPoint(f.mouth, Vector2.new(x, y))
-                        local origin = f.sample.Origin + (f.aimOffset or V0)
-                        local direction = point - origin
-                        if vec(direction) and direction.Magnitude > 1e-5 then
-                            local yaw, pitch = angles(direction.Unit)
-                            local aim = aimAt(f, yaw, pitch)
-                            local rating = rate(f, aim, false)
-                            if rating and bestShotTargetAllowed(f, rating, bestShotSide) then
-                                chosen, best, selectedCandidate, selectedCurve = aim, rating, nil, f.curve
-                            end
-                        end
-                    end
-                end
-            end
-        end
         if choice and not chosen then
             -- A commitment is not a cached collision verdict. If no checked route
             -- with this curve is valid now, allow the validated ordinary fallback.
             owner.curveChoice, choice = nil, nil
-            if normal and (not bestShotReady or bestShotTargetAllowed(f, normal, bestShotSide)) then
-                chosen, best, selectedCandidate, selectedCurve = table.clone(sample), normal, nil, f.curve
-            end
+            if normal then chosen, best, selectedCandidate, selectedCurve = table.clone(sample), normal, nil, f.curve end
         end
         owner.selectedCandidate = selectedCandidate
         owner.completedAlternatives = #owner.candidates
@@ -6340,6 +6756,24 @@ local function createStriker(d)
         end
         owner.bestGap = best.gap
         owner.selectedCurve = selectedCurve
+
+        -- Start moving the aim toward the far side at 60% charge and finish
+        -- the redirect at 72%. This keeps the early camera aim stable while
+        -- preventing a late snap.
+        local redirectAlpha = math.clamp(
+            (f.charge - C.BestShotRedirectStart)
+                / math.max(0.001, C.BestShotRedirectFull - C.BestShotRedirectStart),
+            0, 1
+        )
+        if redirectAlpha < 1 then
+            local blended = table.clone(chosen)
+            local direction = sample.Direction:Lerp(chosen.Direction, redirectAlpha)
+            if direction.Magnitude > 1e-5 then
+                blended.Direction = direction.Unit
+            end
+            chosen = blended
+        end
+
         if f.autoCurve and (choice or decideCurve) then
             owner.curveChoice = { curve = selectedCurve, frame = f,
                 candidate = { direction = chosen.Direction, frame = f, at = clock,
@@ -6349,30 +6783,14 @@ local function createStriker(d)
             owner.pair = { aim = chosen, direction = chosen.Direction, curve = selectedCurve,
                 manualCurve = f.curve, character = f.character, context = f.context, ballId = f.ballId }
         end
-        -- Blend from the user's original aim into the validated opposite-side
-        -- solution during the final charge window. The endpoint remains the
-        -- validated flick trajectory; smoothness only controls how quickly we turn.
-        if owner.flickActive and not owner.flickFallback and best and selectedCandidate
-            and candidateSide(f, selectedCandidate) == flickSide then
-            local alpha = math.clamp(owner.flickAlpha or 1, 0, 1)
-            if alpha < 0.999 then
-                local blended = table.clone(chosen)
-                local direction = sample.Direction:Lerp(chosen.Direction, alpha)
-                if direction.Magnitude > 1e-5 then blended.Direction = direction.Unit end
-                chosen = blended
-            end
-        end
         owner.applied, owner.rating, owner.direction = true, best, chosen.Direction
         owner.appliedAim = table.clone(chosen)
-        owner.flicked = owner.flickActive and not owner.flickFallback
-            and (owner.flickAlpha or 0) >= 0.999
-            and candidateSide(f, selectedCandidate) == flickSide
         owner.redirected = (chosen.Direction - sample.Direction).Magnitude > 1e-5 or math.abs(selectedCurve - f.curve) > 1e-5
-        owner.reason = owner.flicked and "flick_assist" or (owner.redirected and "assisted" or "confirmed_aim")
+        owner.reason = owner.redirected and "assisted" or "confirmed_aim"
         stats.lastCharge, stats.lastCurve = f.charge, selectedCurve
-        setStatus(owner.flicked and "FLICK ASSIST" or (best.defenderRisk == 2 and "DEFENDER IN SHOT PATH"
+        setStatus(best.defenderRisk == 2 and "DEFENDER IN SHOT PATH"
             or (best.defenderRisk == 1 and "DEFENDERS COVER SHOT")
-            or (not owner.redirected and "AIM CONFIRMED" or (best.gap >= C.ClearGapThreshold and "OUTSIDE MODELED REACH" or "BEST AVAILABLE SHOT"))),
+            or (not owner.redirected and "AIM CONFIRMED" or (best.gap >= C.ClearGapThreshold and "OUTSIDE MODELED REACH" or "BEST AVAILABLE SHOT")),
             decisionDetail(owner))
         local scope = scopes[thread()]
         if scope then scope.applied = true end
@@ -6450,14 +6868,21 @@ local function createStriker(d)
         if not inBudget() or not now then return nil end
         local remaining = f.maximumCharge - f.elapsed
         local laterBest
+        local function worthReleasing(later)
+            return not later
+                or ((now.defenderRisk or 0) ~= (later.defenderRisk or 0) and betterRating(now, later))
+                or ((now.defenderRisk or 0) == (later.defenderRisk or 0) and now.score >= later.score + C.ReleaseMargin)
+        end
         for _, delay in ipairs({ remaining / 2, remaining }) do
             local later, valid = evaluate(delay)
             if not inBudget() or not valid then return nil end
             if betterRating(later, laterBest) then laterBest = later end
+            -- One better future option is enough to keep holding. Only an early
+            -- release requires all comparisons; avoid an unnecessary full-power
+            -- simulation when the halfway option already rules release out.
+            if not worthReleasing(laterBest) then break end
         end
-        local release = not laterBest
-            or ((now.defenderRisk or 0) ~= (laterBest.defenderRisk or 0) and betterRating(now, laterBest))
-            or ((now.defenderRisk or 0) == (laterBest.defenderRisk or 0) and now.score >= laterBest.score + C.ReleaseMargin)
+        local release = worthReleasing(laterBest)
         owner.releaseTiming = { decision = release and "release" or "wait", charge = f.charge,
             nowScore = now.score, laterScore = laterBest and laterBest.score or nil,
             nowDefenderRisk = now.defenderRisk, laterDefenderRisk = laterBest and laterBest.defenderRisk or nil }
@@ -6701,14 +7126,11 @@ local function createStriker(d)
                 if session.smartDispatched then stats.autoReleases += 1 end
                 if session.applied then stats.assisted += 1 end
                 if session.applied and session.redirected then stats.redirected += 1 end
-                if session.flicked then stats.flicks += 1 end
                 if session.applied and not session.redirected then stats.confirmed += 1 end
                 stats.lastCharge, stats.lastCurve = command.ChargeSeconds or 0, command.Curve or 0
                 table.insert(recentShots, { charge = stats.lastCharge, curve = stats.lastCurve,
                     assisted = session.applied == true, aimLocked = session.locked == true,
                     redirected = session.applied == true and session.redirected == true,
-                    flicked = session.flicked == true,
-                    flickSide = session.flickSide,
                     decision = session.reason or "native", bestCandidateGap = session.bestGap,
                     completedAlternatives = session.completedAlternatives or 0,
                     checkedAlternatives = session.checkedAlternatives or 0,
@@ -6817,28 +7239,20 @@ local function createStriker(d)
         end
         return true
     end
-    function A.SetFlickSmoothness(value)
-        if not alive or installing then return false end
-        A.FlickSmoothness = math.clamp(math.floor(tonumber(value) or 6), 1, 10)
-        return true
-    end
-    function A.SetFlickAssist(value)
-        if not alive or installing then return false end
-        if value and not A.Enabled and not A.SetEnabled(true) then return false end
-        A.FlickAssist = value == true
-        if session and not session.locked then
-            session.flicked, session.flickActive, session.flickSide, session.flickFallback = false, false, 0, false
-            session.job = nil
-            table.clear(session.candidates)
-        end
-        return true
-    end
     function A.SetSmartRelease(value)
         if not alive or installing then return false end
         if value and not A.Enabled and not A.SetEnabled(true) then return false end
         A.SmartRelease = value == true
         -- Enabling applies to the next user press. Disabling stops an active check.
         if session and not A.SmartRelease then session.smartRelease = false end
+        return true
+    end
+    function A.GetAssistRange()
+        return C.MaxAssistDistance
+    end
+    function A.SetAssistRange(value)
+        if not alive or not num(value) then return false end
+        C.MaxAssistDistance = math.clamp(math.floor(value + 0.5), 40, 100)
         return true
     end
     function A.Cleanup()
@@ -6850,9 +7264,9 @@ local function createStriker(d)
         return restore()
     end
     function A.Debug()
-        return { enabled = A.Enabled, autoCurve = A.AutoCurve, smartRelease = A.SmartRelease, flickAssist = A.FlickAssist, flickSmoothness = A.FlickSmoothness, ready = A.Ready, status = A.Status, detail = A.Detail,
+        return { enabled = A.Enabled, autoCurve = A.AutoCurve, smartRelease = A.SmartRelease, ready = A.Ready, status = A.Status, detail = A.Detail,
             lastError = A.LastError, stats = table.clone(stats), active = session ~= nil,
-            locked = session and session.locked or false, recentShots = table.clone(recentShots), prototype = "STR 0.16",
+            locked = session and session.locked or false, recentShots = table.clone(recentShots), prototype = "STR 0.16.3",
             defenderAwareness = true,
             releaseTiming = session and session.releaseTiming or nil,
             maxAssistDistance = C.MaxAssistDistance, clearGapThreshold = C.ClearGapThreshold }
@@ -6862,7 +7276,7 @@ local function createStriker(d)
         betterRating = betterRating,
         solve = solve, frame = frame, scopeCall = scopeCall, choose = choose, native = N,
         compatible = compatible, launch = launch, rate = rate, stats = stats, keepersFor = keepersFor, candidateAim = candidateAim,
-        horizontalReach = horizontalReach, searchTargets = searchTargets, shotZone = shotZone, flickAimSide = flickAimSide, keeperBias = keeperBias, flickTargetSide = flickTargetSide, candidateSide = candidateSide,
+        horizontalReach = horizontalReach, searchTargets = searchTargets, shotZone = shotZone, insetAim = insetAim,
         setSession = function(value) session = value end, getSession = function() return session end } end
     return A
 end
@@ -6874,34 +7288,64 @@ local function createStrikerMisc(d)
     local alive, loadingDribble, loadingStamina = true, false, false
     local generation, staminaGeneration = 0, 0
     local heartbeat, inputConnection = nil, nil
+    local controlConnection, pickupWindow = nil, nil
+    local scanning, manualHadBall = false, true
+    local attackConnections = {}
+    local characterConnections = {}
+    local characterIndex = setmetatable({}, { __mode = "k" })
+    local characterIndexReady = false
+    local attacks = setmetatable({}, { __mode = "k" })
     local ownershipHook, nativeOwner = nil, nil
-    local staminaHeartbeat, guardHook, correctionPending = nil, nil, nil
+    local queuedScan, requestScan = nil, nil
+    local nextPingSample, networkLead = 0, 0
+    local guardHook = nil
     local placementHook = nil
-    local nextStaminaRetry = 0
     local nextTick, nextDiscovery, manualUntil, retryAt = 0, 0, 0, 0
-    local slideRecoveryUntil = 0
     local candidates, cachedCharacter = {}, nil
     local staminaSource = "DmcStamina_" .. d.id
     local staminaOwned = false
     local stats = { scans = 0, threats = 0, proximityTriggers = 0, tackleTriggers = 0, kickTriggers = 0,
         attempts = 0, started = 0, nativeBlocked = 0, localCorrections = 0,
         staminaAutoOff = 0, positionRepairs = 0, staminaBudgetResets = 0,
-        observerErrors = 0, errors = 0, maxTickMs = 0 }
+        observerErrors = 0, errors = 0, maxTickMs = 0, readyTicks = 0, blockedTicks = 0,
+        motionAligned = 0, kickStateWithoutPresentation = 0, earlyAttackSamples = 0,
+        pickupReadinessWakes = 0, pickupInputResets = 0 }
     local recent = {}
+    local blockedBy, recentGates = {}, {}
+    local lastScan = nil
     local lastCorrection = nil
-    local C = { Interval = 1 / 60, DiscoverySeconds = 0.08, Range = 45, Lookahead = 0.30, KickLookahead = 0.18,
-        RetrySeconds = 0.18, Step = 0.015, Padding = 1.2, ManualGrace = 0.18, SlideRecovery = 0.12 }
+    local C = { Interval = 1 / 60, DiscoverySeconds = 0.15, Range = 40, Lookahead = 0.22, KickLookahead = 0.12,
+        RetrySeconds = 0.25, Step = 0.025, Padding = 1.0, ManualGrace = 0.15, MaximumDisplayLead = 0.20,
+        ChargeStateGrace = 0.10, MaximumNetworkLead = 0.12, PingSampleSeconds = 0.5,
+        PickupReadySeconds = 0.35 }
     local function flat(v) return Vector3.new(v.X, 0, v.Z) end
     local function finite(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
     local function vector(v) return typeof(v) == "Vector3" and finite(v.X) and finite(v.Y) and finite(v.Z) end
+    local function attackDirection(value)
+        if typeof(value) == "table" or typeof(value) == "Ray" then value = value.Direction end
+        if not vector(value) then return nil end
+        local direction = flat(value)
+        return direction.Magnitude > 1e-5 and direction.Unit or nil
+    end
     local function problem(err)
         A.LastError = tostring(err)
         stats.errors += 1
         warn("[Dmc Misc] " .. A.LastError)
     end
     local function stopWatch()
+        queuedScan = nil
+        nextPingSample, networkLead = 0, 0
         if heartbeat then heartbeat:Disconnect(); heartbeat = nil end
         if inputConnection then inputConnection:Disconnect(); inputConnection = nil end
+        if controlConnection then controlConnection:Disconnect(); controlConnection = nil end
+        pickupWindow = nil
+        for _, connection in ipairs(attackConnections) do connection:Disconnect() end
+        table.clear(attackConnections)
+        for _, connection in ipairs(characterConnections) do connection:Disconnect() end
+        table.clear(characterConnections)
+        table.clear(characterIndex)
+        characterIndexReady = false
+        table.clear(attacks)
         if ownershipHook then
             ownershipHook.active = false
             if d.M.Dodge.SetOwnerUserId == ownershipHook.wrapper then
@@ -6914,7 +7358,6 @@ local function createStrikerMisc(d)
         nextDiscovery = 0
     end
     local function stopStaminaWatch()
-        if staminaHeartbeat then staminaHeartbeat:Disconnect(); staminaHeartbeat = nil end
         if guardHook then
             guardHook.active = false
             -- A later wrapper belongs to its installer; leave our inner observer passive.
@@ -6928,12 +7371,12 @@ local function createStrikerMisc(d)
             end
             placementHook = nil
         end
-        correctionPending = nil
     end
     local function noteCorrection(correction)
         lastCorrection = correction
-        if not correctionPending then correctionPending = correction end
-        A.StaminaStatus = "CORRECTION DETECTED"
+        -- Corrections are observations, not requests to change the user's switch.
+        -- The native guard/placement functions still apply their normal repairs.
+        A.StaminaStatus = "LOCAL ON"
     end
     local function startPlacementWatch()
         local hook = { original = N.Placement.RepairPosition, active = true }
@@ -6957,7 +7400,7 @@ local function createStrikerMisc(d)
             stats.positionRepairs += 1
             noteCorrection({ clock = os.clock(), context = sample.context, positionChange = delta.Magnitude,
                 horizontalChange = horizontal.Magnitude, source = "CharacterPlacement.RepairPosition",
-                staminaWasOn = true, serverConfirmed = false, offStatus = "OFF: POSITION REPAIR" })
+                staminaWasOn = true, serverConfirmed = false })
         end
         hook.observer = function(character, root, target, ...)
             local captured, sample = pcall(capture, character, root, target)
@@ -6972,30 +7415,6 @@ local function createStrikerMisc(d)
         end
         placementHook = hook
         N.Placement.RepairPosition = hook.observer
-    end
-    local function recoverStamina(correction)
-        -- Remove our local source before spending; otherwise native SpendStamina returns true, 0.
-        if staminaOwned then
-            N.Sprint.SetUnlimitedStamina(staminaSource, false)
-            staminaOwned = false
-        end
-        A.InfiniteStamina = false
-        if not correction.budgetReset then
-            local before = N.Sprint.GetStamina()
-            local multiplier = N.StaminaRules.GetStaminaMultiplier()
-            assert(finite(before) and finite(multiplier), "Native stamina recovery data unavailable")
-            if before > 0 then
-                -- The server's actual budget is unknown. Empty the artificially refilled local
-                -- budget conservatively, then let native recovery handle stamina and walk speed.
-                -- Game-owned unlimited sources/boosts still take priority inside SpendStamina.
-                N.Sprint.SpendStamina(before * math.max(1, multiplier), true)
-            end
-            local after = N.Sprint.GetStamina()
-            correction.staminaBeforeReset, correction.staminaAfterReset = before, after
-            correction.budgetReset = true
-            if finite(after) and after < before then stats.staminaBudgetResets += 1 end
-        end
-        return A.SetInfiniteStamina(false)
     end
     local function startStaminaWatch()
         assert(type(N.Guard.Validate) == "function", "Movement correction observer unavailable")
@@ -7025,7 +7444,6 @@ local function createStrikerMisc(d)
                 local ok = pcall(noteRejected, root, claimedPosition, claimedVelocity)
                 if not ok then
                     stats.observerErrors += 1
-                    correctionPending = correctionPending or { source = "LocalMovementGuard.Validate", detail = "diagnostic unavailable" }
                 end
             end
             return result
@@ -7033,23 +7451,7 @@ local function createStrikerMisc(d)
         guardHook = hook
         N.Guard.Validate = hook.observer
         startPlacementWatch()
-        staminaHeartbeat = d.Run.Heartbeat:Connect(function()
-            if not (alive and d.alive() and correctionPending) or os.clock() < nextStaminaRetry then return end
-            nextStaminaRetry = os.clock() + 1
-            -- Apply the native switch outside Validate, after its physics correction.
-            local correction = correctionPending
-            local ok, stopped = pcall(recoverStamina, correction)
-            if ok and stopped then
-                stats.staminaAutoOff += 1
-                lastCorrection = correction
-                A.StaminaStatus = correction.offStatus or "OFF: LOCAL CORRECTION"
-            else
-                -- Keep the pending shutdown and observer until native release succeeds.
-                correctionPending = correction
-                A.StaminaStatus = "CLEANUP REQUIRED"
-                if not ok then stats.observerErrors += 1 end
-            end
-        end)
+        -- No automatic shutoff, stamina drain, or correction retry loop.
     end
     local function stopDribbleWatch(err)
         A.AutoDribble = false
@@ -7073,7 +7475,8 @@ local function createStrikerMisc(d)
             { N.Tackle, "GetMaximumTravelBetween" }, { N.Sprint, "CanSpendStamina" },
             { N.Shoot, "IsCharging" }, { N.ChargeState, "IsCharging" }, { N.Effects, "GetObservedChargeFill" },
             { N.KickCore, "GetMinimumReleaseDelaySeconds" }, { N.Power, "GetChargeConstants" },
-            { d.M.Dodge, "HandleInputBegan" }, { d.M.Dodge, "IsDribbling" } }) do
+            { d.M.Dodge, "HandleInputBegan" }, { d.M.Dodge, "IsDribbling" },
+            { d.M.Dodge, "UpdateControlState" } }) do
             assert(type(item[1][item[2]]) == "function", "Missing native dribble API: " .. item[2])
         end
         N.Dodge = N.Dodge or d.load("Modules.Actions.Dodge")
@@ -7088,6 +7491,7 @@ local function createStrikerMisc(d)
         local hook = { original = d.M.Dodge.SetOwnerUserId, active = true }
         assert(type(hook.original) == "function", "Native dribble ownership unavailable")
         hook.wrapper = function(userId, ...)
+            local previous = nativeOwner
             if hook.active then nativeOwner = nil end
             local result = table.pack(hook.original(userId, ...))
             if hook.active and alive and A.AutoDribble and d.alive() then
@@ -7095,6 +7499,25 @@ local function createStrikerMisc(d)
                     local ch = d.Player.Character
                     nativeOwner = ch and { character = ch, ballId = currentBallId(),
                         context = d.M.Motion.GetContext(ch), userId = userId } or nil
+                    if nativeOwner and userId == d.Player.UserId and (not previous
+                        or previous.userId ~= userId or previous.character ~= ch
+                        or previous.ballId ~= nativeOwner.ballId or previous.context ~= nativeOwner.context) then
+                        -- Receipt can follow a refused attempt or a roster refresh.
+                        -- Finish the native handoff before evaluating the packet batch.
+                        pickupWindow = { character = ch, ballId = nativeOwner.ballId,
+                            context = nativeOwner.context, expires = os.clock() + C.PickupReadySeconds }
+                        -- A press made while chasing the loose ball must not carry
+                        -- its grace delay into the newly owned ball. Active native
+                        -- strikes, slides and jumps still enforce their own gates.
+                        if not manualHadBall and manualUntil > os.clock() then
+                            manualUntil = 0
+                            stats.pickupInputResets += 1
+                        end
+                        nextTick, nextDiscovery, retryAt = 0, 0, 0
+                        requestScan()
+                    elseif userId ~= d.Player.UserId then
+                        pickupWindow = nil
+                    end
                 end)
                 if not ok then nativeOwner = nil; stats.observerErrors += 1 end
             end
@@ -7111,53 +7534,213 @@ local function createStrikerMisc(d)
         end
         return d.M.Renderer.GetOwnedUserId() == d.Player.UserId
     end
+    local function watchPickupReadiness()
+        if type(N.Controls.OnStateChanged) ~= "function" then return end
+        local function changed(name, field, active, available, _, cooldown)
+            if scanning or not (alive and A.AutoDribble and d.alive()) then return end
+            local pickup = pickupWindow
+            if not pickup then return end
+            local ch = d.Player.Character
+            if os.clock() > pickup.expires or ch ~= pickup.character or not ch or not ch.Parent
+                or currentBallId() ~= pickup.ballId or d.M.Motion.GetContext(ch) ~= pickup.context then
+                pickupWindow = nil
+                return
+            end
+            local becameReady = name == "Dribble" and available == true and cooldown ~= true
+                and (field == "Available" or field == "Cooldown")
+            local strikeEnded = field == "Active" and active == false
+                and (name == "Kick" or name == "Pass" or name == "Lob" or name == "RainbowFlick")
+            if not (becameReady or strikeEnded) or not ownsBall(ch) or d.M.Dodge.IsDribbling() then return end
+            -- The ownership scan may have run before the native pickup/landing
+            -- handoff cleared Unready. Wake on that transition rather than wait
+            -- for another heartbeat; defer so the entire native callback finishes.
+            stats.pickupReadinessWakes += 1
+            nextTick = 0
+            requestScan()
+        end
+        controlConnection = N.Controls.OnStateChanged(function(...)
+            local ok = pcall(changed, ...)
+            if not ok then stats.observerErrors += 1 end
+        end)
+    end
     local function eligible()
         if not (alive and A.AutoDribble and d.alive()) then return nil, "OFF" end
-        if d.suspended() or N.Input.ShouldIgnoreKeybind(false) or d.Gui.MenuIsOpen
-            or os.clock() < manualUntil then return nil, "PAUSED" end
+        local suspended, suspendReason = d.suspended()
+        if suspended then return nil, suspendReason or "INPUT PAUSED" end
+        if d.Gui.MenuIsOpen then return nil, "MENU OPEN" end
+        if N.Input.ShouldIgnoreKeybind(false) then return nil, "TEXT / KEYBIND" end
+        if os.clock() < manualUntil then return nil, "MANUAL INPUT" end
         local ch = d.Player.Character
         local hum = ch and ch:FindFirstChildOfClass("Humanoid")
         local root = ch and ch:FindFirstChild("HumanoidRootPart")
         if not ch or not ch.Parent or not root or not hum or hum.Health <= 0 then return nil, "WAITING" end
         if d.M.Match.IsGoalkeeperCharacter(ch) then return nil, "GK ROLE" end
-        if d.M.Freeze.IsFrozen() or d.M.Replay.IsActive() or d.M.Controllers.IsSuspended(ch) then return nil, "PAUSED" end
+        if d.M.Freeze.IsFrozen() then return nil, "FROZEN" end
+        if d.M.Replay.IsActive() then return nil, "REPLAY" end
+        if d.M.Controllers.IsSuspended(ch) then return nil, "RECOVERING" end
         if not ownsBall(ch) then return nil, "NO BALL" end
         if N.Shoot.IsCharging() then return nil, "SHOOTING" end
         for _, name in ipairs({ "Kick", "Pass", "Lob", "RainbowFlick" }) do
             if N.Controls.IsActive(name) then return nil, "STRIKING" end
         end
         if d.M.Dodge.IsDribbling() then return nil, "DRIBBLING" end
-        local slidingNow = d.M.Slide.IsSlideTackling()
-        if slidingNow then
-            slideRecoveryUntil = math.max(slideRecoveryUntil, os.clock() + C.SlideRecovery)
-            return nil, "SLIDING"
-        end
-        -- Slide animations can keep the native controller in MOVING briefly after
-        -- the tackle state has ended. Give the character a short recovery window,
-        -- then accept either the native landed flag or a grounded Humanoid state.
-        if os.clock() < slideRecoveryUntil then return nil, "SLIDE RECOVERY" end
-        local landed = d.M.Controllers.IsLanded(ch, hum)
-        if not landed then
-            local state = hum:GetState()
-            landed = state ~= Enum.HumanoidStateType.Freefall
-                and state ~= Enum.HumanoidStateType.Jumping
-                and state ~= Enum.HumanoidStateType.FallingDown
-                and state ~= Enum.HumanoidStateType.Ragdoll
-        end
-        if not landed then return nil, "MOVING" end
+        -- Native availability/HandleInputBegan own the action override. A slide's
+        -- presentation can outlast that override after a grounded ball pickup.
+        if not d.M.Controllers.IsLanded(ch, hum) then return nil, "MOVING" end
         if not N.Controls.IsAvailable("Dribble") or N.Controls.IsOnCooldown("Dribble") then return nil, "COOLDOWN / BLOCKED" end
         if not N.Sprint.CanSpendStamina(N.Dodge.Constants.StaminaCost, true) then return nil, "LOW STAMINA" end
         if os.clock() < retryAt then return nil, "RETRY WAIT" end
         return ch, root
     end
+    local function noteGate(reason)
+        local gate = reason or "READY"
+        if gate == "COOLDOWN / BLOCKED" then
+            gate = N.Controls.IsOnCooldown("Dribble") and "COOLDOWN" or "NATIVE UNREADY"
+        end
+        if reason then
+            stats.blockedTicks += 1
+            blockedBy[gate] = (blockedBy[gate] or 0) + 1
+        else
+            stats.readyTicks += 1
+        end
+        local last = recentGates[#recentGates]
+        if not last or last.reason ~= gate then
+            recentGates[#recentGates + 1] = { reason = gate, clock = os.clock() }
+            if #recentGates > 12 then table.remove(recentGates, 1) end
+        end
+    end
+    local function resolveCharacter(character)
+        return character and type(d.M.Motion.ResolveCharacter) == "function"
+            and d.M.Motion.ResolveCharacter(character) or character
+    end
+    local function actorFor(character, actor)
+        if actor and actor ~= character and resolveCharacter(actor.Character) == character then return actor end
+        if type(d.M.Actors.GetFromCharacter) == "function" then
+            actor = d.M.Actors.GetFromCharacter(character)
+        else
+            local userId = character:GetAttribute("UserId")
+            actor = finite(userId) and d.M.Actors.GetByUserId(userId) or nil
+        end
+        return actor and resolveCharacter(actor.Character) == character and actor or nil
+    end
+    local function characterTeam(character, actor)
+        if actor then return d.M.Teams.GetActorTeamName(actor) end
+        if type(d.M.Teams.GetCharacterTeamName) == "function" then
+            return d.M.Teams.GetCharacterTeamName(character)
+        end
+        return d.M.Teams.GetActorTeamName(character)
+    end
+    local function watchCharacters()
+        if not workspace.DescendantAdded or not workspace.DescendantRemoving then return end
+        local function added(node)
+            local model
+            if node:IsA("Model") then
+                if node:FindFirstChildOfClass("Humanoid") or node:FindFirstChild("HumanoidRootPart") then model = node end
+            elseif node:IsA("Humanoid") or (node:IsA("BasePart") and node.Name == "HumanoidRootPart") then
+                model = node.Parent
+            end
+            if model and model:IsA("Model") then
+                characterIndex[model] = true
+                nextDiscovery, nextTick = 0, 0
+            end
+        end
+        characterConnections[#characterConnections + 1] = workspace.DescendantAdded:Connect(added)
+        characterConnections[#characterConnections + 1] = workspace.DescendantRemoving:Connect(function(node)
+            if characterIndex[node] then
+                characterIndex[node] = nil
+                nextDiscovery, nextTick = 0, 0
+            end
+        end)
+        for _, node in ipairs(workspace:GetDescendants()) do added(node) end
+        characterIndexReady = true
+    end
+    local function observeAttack(kind, userId, ...)
+        if kind ~= "TackleStarted" and kind ~= "KickChargeStarted" and kind ~= "KickChargeUpdated"
+            and kind ~= "KickReleased" and kind ~= "KickChargeCanceled" then return end
+        if not finite(userId) or userId == d.Player.UserId then return end
+        local actor = d.M.Actors.GetByUserId(userId)
+        local character = resolveCharacter(actor and actor.Character)
+        if not character or not character.Parent then return end
+        local now, context = workspace:GetServerTimeNow(), d.M.Motion.GetContext(character)
+        local state = attacks[character]
+        if not state or state.context ~= context then state = { context = context }; attacks[character] = state end
+        local started = select(7, ...)
+        if kind == "TackleStarted" then
+            if not finite(started) then return end
+            if started > now or now - started > N.Tackle.Constants.HitboxDelaySeconds + N.Tackle.Constants.HitboxSeconds then return end
+            if state.slideStarted and started <= state.slideStarted then return end
+            state.slideStarted = started
+            state.slideDirection = attackDirection(select(2, ...))
+        else
+            local actionId, presentationId, sequence = select(9, ...), select(11, ...), select(13, ...)
+            local previous = state.kick
+            if previous then
+                if finite(presentationId) and finite(previous.presentationId) then
+                    if presentationId < previous.presentationId then return end
+                elseif actionId ~= nil and previous.actionId ~= nil and actionId ~= previous.actionId
+                    and kind ~= "KickChargeStarted" then return end
+            end
+            local same = previous and ((presentationId ~= nil and presentationId == previous.presentationId)
+                or (presentationId == nil and actionId ~= nil and actionId == previous.actionId))
+            local terminal = kind == "KickReleased" or kind == "KickChargeCanceled"
+            if same and not terminal then
+                if previous.ended then return end
+                if finite(sequence) and finite(previous.sequence) and sequence <= previous.sequence then return end
+            end
+            if terminal then
+                state.kick = { ended = true, actionId = actionId, presentationId = presentationId }
+            else
+                local passType, charge = select(1, ...), select(3, ...)
+                if not finite(charge) or charge < 0 or not finite(started) or started > now then return end
+                if previous and finite(previous.started) and started < previous.started then return end
+                if passType ~= "Shot" then
+                    state.kick = { ended = true, actionId = actionId, presentationId = presentationId }
+                    return
+                end
+                local constants = N.Power.GetChargeConstants(actor, N.KickCore.Constants)
+                if not constants or not finite(constants.MaximumChargeSeconds) then return end
+                if now - started > constants.MaximumChargeSeconds + 0.25 then return end
+                state.kick = { started = started, charge = charge, at = now,
+                    actionId = actionId, presentationId = presentationId, sequence = sequence,
+                    -- p274 is the launch aim, p285 its flat kick direction.
+                    -- p272 is animation direction and must not substitute for aim.
+                    direction = attackDirection(select(4, ...)) or attackDirection(select(15, ...)),
+                    sawCharging = N.ChargeState.IsCharging(actor) or (same and previous.sawCharging) or false,
+                    expires = started + constants.MaximumChargeSeconds + 0.25 }
+            end
+        end
+        stats.earlyAttackSamples += 1
+        nextTick, nextDiscovery = 0, 0
+        requestScan()
+    end
+    local function watchAttacks()
+        -- TackleEffects queues these same packets through ReplayEvents.PresentAt.
+        -- Read timing on receipt so presentation delay cannot hide the windup.
+        -- Ordered start/update packets supply charge evidence before attributes
+        -- replicate. Cancellation/end packets and predicted contact still gate it.
+        for _, remote in ipairs(d.AttackRemotes or {}) do
+            attackConnections[#attackConnections + 1] = remote.OnClientEvent:Connect(function(...)
+                if not (alive and A.AutoDribble and d.alive()) then return end
+                local ok = pcall(observeAttack, ...)
+                if not ok then stats.observerErrors += 1 end
+            end)
+        end
+    end
     local function discover(ch)
         local seen, list = {}, {}
         local function add(character, actor)
+            character = resolveCharacter(character)
             if not character or character == ch or seen[character] then return end
             seen[character] = true
-            list[#list + 1] = { character = character, actor = actor or character }
+            list[#list + 1] = { character = character, actor = actorFor(character, actor) }
         end
         for _, player in ipairs(d.Players:GetPlayers()) do add(player.Character, player) end
+        for character in pairs(characterIndex) do
+            if character:IsDescendantOf(workspace) then add(character) end
+        end
+        -- An attack packet also identifies its actor even if its model has just
+        -- streamed in or has not appeared in a discovery snapshot yet.
+        for character in pairs(attacks) do if character.Parent then add(character) end end
         local folder = workspace:FindFirstChild("Characters")
         local function children(container)
             if not container then return end
@@ -7165,8 +7748,10 @@ local function createStrikerMisc(d)
                 if child:IsA("Model") then add(child) end
             end
         end
-        children(folder)
-        children(folder and folder:FindFirstChild("NPCs"))
+        if not characterIndexReady then
+            children(folder)
+            children(folder and folder:FindFirstChild("NPCs"))
+        end
         candidates, cachedCharacter = list, ch
         nextDiscovery = os.clock() + C.DiscoverySeconds
     end
@@ -7187,20 +7772,90 @@ local function createStrikerMisc(d)
         end
         return true
     end
-    local function contactTime(ownCF, ownVelocity, otherCF, otherVelocity, age)
+    local function alignDisplayedMotion(character, cf: CFrame, velocity: Vector3, slideAge: number?, slideDirection: Vector3?): (CFrame, number)
+        local motion = d.M.Motion
+        if type(motion.GetDisplayDelaySeconds) ~= "function"
+            or type(motion.GetSimulationRoot) == "function" and motion.GetSimulationRoot(character) then return cf, 0 end
+        local delay: number = motion.GetDisplayDelaySeconds(character)
+        if not finite(delay) or delay <= 0 then return cf, 0 end
+        delay = math.min(delay, C.MaximumDisplayLead)
+        local displacement = velocity * delay
+        if slideAge then
+            local direction = slideDirection or flat(velocity)
+            if not slideDirection and direction.Magnitude < 1 then direction = flat(cf.LookVector) end
+            if direction.Magnitude > 1e-5 then
+                local constants = N.Tackle.Constants
+                local motionSeconds = math.min(delay, slideAge)
+                local travel = N.Tackle.GetMaximumTravelBetween(slideAge - motionSeconds, slideAge,
+                    constants.StartupDashDistance, constants.Distance)
+                displacement = flat(velocity) * (delay - motionSeconds) + direction.Unit * travel
+                    + Vector3.new(0, velocity.Y * delay, 0)
+            end
+        end
+        -- GetCFrame may be an interpolated display pose. Attack age is server time:
+        -- bring the pose onto that timeline before predicting future contact.
+        -- This is a bounded estimate, never a character movement write.
+        return cf + displacement, delay
+    end
+    local function contactEnvelope(rootCF, box, observedPosition, ownCF, ownSize)
+        local extent = Vector3.new(C.Padding, C.Padding, C.Padding)
+        if ownCF and vector(ownSize) and ownSize.X > 0 and ownSize.Y > 0 and ownSize.Z > 0 then
+            -- Sweep the carrier's root volume, not just its center. Project its
+            -- oriented half-extents into the attack box's axes so rear/side grazes
+            -- remain visible as either character turns. This is a conservative
+            -- contact estimate; it never changes either character's hitbox.
+            local attackCF = rootCF * box.CFrameOffset
+            local right = attackCF:VectorToObjectSpace(ownCF.RightVector) * (ownSize.X * 0.5)
+            local up = attackCF:VectorToObjectSpace(ownCF.UpVector) * (ownSize.Y * 0.5)
+            local forward = attackCF:VectorToObjectSpace(ownCF.LookVector) * (ownSize.Z * 0.5)
+            -- The existing margin already covered the unrotated root. Replace it
+            -- only where the projected body is larger; do not stack two margins
+            -- and turn a nearby kick that misses into a dribble trigger.
+            extent = Vector3.new(math.max(C.Padding, math.abs(right.X) + math.abs(up.X) + math.abs(forward.X)),
+                math.max(C.Padding, math.abs(right.Y) + math.abs(up.Y) + math.abs(forward.Y)),
+                math.max(C.Padding, math.abs(right.Z) + math.abs(up.Z) + math.abs(forward.Z)))
+        end
+        local half = box.Size * 0.5 + extent
+        if observedPosition then
+            -- Extrapolation is an estimate. Cover the bounded space between the
+            -- displayed and estimated pose rather than throwing the display pose
+            -- away. Otherwise compensation can advance a close attack past us.
+            local delta = observedPosition - rootCF.Position
+            local offset = (rootCF * box.CFrameOffset):VectorToObjectSpace(delta)
+            half += Vector3.new(math.abs(offset.X), math.abs(offset.Y), math.abs(offset.Z)) * 0.5
+            rootCF += delta * 0.5
+        end
+        return rootCF, half
+    end
+    local function reactionLead()
+        local clock = os.clock()
+        if clock >= nextPingSample then
+            nextPingSample = clock + C.PingSampleSeconds
+            -- GetNetworkPing reports round-trip seconds. Half is a bounded
+            -- estimate of the outbound dodge request's travel time. Display
+            -- alignment corrects the opponent pose; it does not cover this trip.
+            local ok, ping = pcall(function() return d.Player:GetNetworkPing() end)
+            networkLead = ok and finite(ping) and ping >= 0 and math.min(ping * 0.5, C.MaximumNetworkLead) or 0
+        end
+        return networkLead
+    end
+    local function contactTime(ownCF, ownVelocity, otherCF, otherVelocity, age, slideDirection, observedPosition, ownSize, horizon)
         local constants = N.Tackle.Constants
         local first = math.max(0, constants.HitboxDelaySeconds - age)
-        local last = math.min(C.Lookahead, constants.HitboxDelaySeconds + constants.HitboxSeconds - age)
+        local last = math.min(horizon or C.Lookahead, constants.HitboxDelaySeconds + constants.HitboxSeconds - age)
         if last < first then return nil end
-        local direction = flat(otherVelocity)
-        if direction.Magnitude < 1 then direction = flat(otherCF.LookVector) end
+        -- A start packet reports the committed dash direction before motion
+        -- interpolation necessarily catches up with a turn into the tackle.
+        local direction = slideDirection or flat(otherVelocity)
+        if not slideDirection and direction.Magnitude < 1 then direction = flat(otherCF.LookVector) end
         if direction.Magnitude < 1e-5 then return nil end
         direction = direction.Unit
         -- The native maximum is conservative through the startup/main-dash handoff.
         -- Recompute from the observed root every scan; never integrate a stale origin.
         local box = d.M.Hitboxes.SlideTackle
-        local half = box.Size * 0.5 + Vector3.new(C.Padding, C.Padding, C.Padding)
         local facing = CFrame.lookAt(otherCF.Position, otherCF.Position + direction)
+        local half
+        facing, half = contactEnvelope(facing, box, observedPosition, ownCF, ownSize)
         local function point(t)
             local travel = N.Tackle.GetMaximumTravelBetween(age, age + t,
                 constants.StartupDashDistance, constants.Distance)
@@ -7218,29 +7873,55 @@ local function createStrikerMisc(d)
         end
         return nil
     end
-    local function kickWindow(candidate)
-        local other, actor = candidate.character, candidate.actor
-        if actor == other then
-            local userId = other:GetAttribute("UserId")
-            actor = finite(userId) and d.M.Actors.GetByUserId(userId) or nil
-        end
-        if not actor or actor.Character ~= other or not finite(actor.UserId)
-            or d.M.Match.IsGoalkeeperCharacter(other) or not N.ChargeState.IsCharging(actor) then return nil end
-        -- Presentation alone can linger after cancellation. Require live native charge state too.
+    local function kickWindow(candidate, horizon)
+        local other = candidate.character
+        local actor = actorFor(other, candidate.actor)
+        if not actor or not finite(actor.UserId) or d.M.Match.IsGoalkeeperCharacter(other) then return nil end
+        local charging = N.ChargeState.IsCharging(actor)
+        -- Presentation alone can linger after cancellation. It must have native
+        -- charge state or a still-live, ordered server start/update packet.
         -- This fill is elapsed / maximum, NOT KickCore's power alpha.
         local fill, compact = N.Effects.GetObservedChargeFill(actor.UserId)
-        if not finite(fill) or fill < 0 or fill > 1 or compact ~= false then return nil end
+        local attack = attacks[other]
+        local early = attack and attack.context == d.M.Motion.GetContext(other) and attack.kick
+        if early then
+            local now = workspace:GetServerTimeNow()
+            if early.ended or now > early.expires then return nil end
+            if charging then early.sawCharging = true
+            elseif early.sawCharging and now - early.at > C.ChargeStateGrace then
+                -- Attribute replication and ordered presentation packets can
+                -- disagree briefly. Only an explicit release/cancel is terminal.
+                -- A stale packet cannot keep a dropped charge live, but it must
+                -- not poison newer updates for the same action either.
+                return nil
+            end
+            local constants = N.Power.GetChargeConstants(actor, N.KickCore.Constants)
+            local maximum = constants and constants.MaximumChargeSeconds
+            if not finite(maximum) or maximum <= 0 then return nil end
+            fill = math.clamp(math.max(now - early.started, early.charge + now - early.at) / maximum, 0, 1)
+            compact = false
+        elseif not charging then return nil end
+        if not finite(fill) or fill < 0 or fill > 1 or compact ~= false then
+            if fill == nil then stats.kickStateWithoutPresentation += 1 end
+            return nil
+        end
         local constants = N.Power.GetChargeConstants(actor, N.KickCore.Constants)
         local maximum = constants and constants.MaximumChargeSeconds
         if not finite(maximum) or maximum <= 0 then return nil end
         local first = N.KickCore.GetMinimumReleaseDelaySeconds(fill * maximum, constants)
-        if not finite(first) or first < 0 or first > C.KickLookahead then return nil end
-        return { first = first, fill = fill }
+        if not finite(first) or first < 0 or first > (horizon or C.KickLookahead) then return nil end
+        return { first = first, fill = fill, direction = early and early.direction or nil }
     end
-    local function kickContactTime(ownCF, ownVelocity, otherCF, otherVelocity, first)
+    local function kickContactTime(ownCF, ownVelocity, otherCF, otherVelocity, first, direction, observedPosition, ownSize, horizon)
         local box = d.M.Hitboxes.Kick
-        local half = box.Size * 0.5 + Vector3.new(C.Padding, C.Padding, C.Padding)
-        -- Standing kicks use the facing hitbox, not slide travel or velocity-facing.
+        local last = horizon or C.KickLookahead
+        if last < first then return nil end
+        -- Predict the aimed hitbox from the received launch aim. The displayed
+        -- torso may still face the previous direction when that packet arrives.
+        if direction then otherCF = CFrame.lookAt(otherCF.Position, otherCF.Position + direction) end
+        local half
+        otherCF, half = contactEnvelope(otherCF, box, observedPosition, ownCF, ownSize)
+        -- Standing kicks retain ordinary movement, not slide travel.
         -- Release can happen any time after minimum charge: this is a threat estimate.
         local function point(t)
             local rootCF = otherCF + otherVelocity * t
@@ -7248,9 +7929,9 @@ local function createStrikerMisc(d)
         end
         local previous = point(first)
         if segmentBox(previous, previous, half) then return first end
-        local steps = math.max(1, math.ceil((C.KickLookahead - first) / C.Step))
+        local steps = math.max(1, math.ceil((last - first) / C.Step))
         for i = 1, steps do
-            local t = first + (C.KickLookahead - first) * i / steps
+            local t = first + (last - first) * i / steps
             local current = point(t)
             if segmentBox(previous, current, half) then return t end
             previous = current
@@ -7258,8 +7939,27 @@ local function createStrikerMisc(d)
         return nil
     end
     local function tick()
+        local character = d.Player.Character
+        if character and character.Parent and ownsBall(character) and not d.M.Dodge.IsDribbling() then
+            -- SetOwnerUserId updates NotOwner, but Unready/Recovery are refreshed
+            -- separately. Use the native refresh before reading those flags.
+            d.M.Dodge.UpdateControlState()
+        end
         local ch, rootOrReason = eligible()
-        if not ch then A.DribbleStatus = rootOrReason; return end
+        noteGate(not ch and rootOrReason or nil)
+        if not ch then
+            A.DribbleStatus = rootOrReason
+            if rootOrReason == "COOLDOWN / BLOCKED" then
+                if N.Controls.IsOnCooldown("Dribble") then
+                    local remaining = type(N.Controls.GetCooldownRemaining) == "function"
+                        and N.Controls.GetCooldownRemaining("Dribble") or nil
+                    A.DribbleStatus = finite(remaining) and string.format("COOLDOWN %.1fs", math.max(0, remaining)) or "COOLDOWN"
+                else
+                    A.DribbleStatus = "NOT READY"
+                end
+            end
+            return
+        end
         local root = rootOrReason
         local team = d.M.Teams.GetActorTeamName(d.Player)
         -- Neutral practice actors share one team; do not guess which is hostile.
@@ -7272,19 +7972,34 @@ local function createStrikerMisc(d)
         if cachedCharacter ~= ch or os.clock() >= nextDiscovery then discover(ch) end
         stats.scans += 1
         A.DribbleStatus = "WATCHING"
+        local lead = reactionLead()
+        local tackleHorizon, kickHorizon = C.Lookahead + lead, C.KickLookahead + lead
+        lastScan = { clock = os.clock(), activeSlides = 0, activeKicks = 0, contacts = 0, maximumDisplayLead = 0,
+            networkLeadSeconds = lead, tackleHorizonSeconds = tackleHorizon, kickHorizonSeconds = kickHorizon }
         local now, best = workspace:GetServerTimeNow(), nil
         for _, candidate in ipairs(candidates) do
             local other = candidate.character
+            candidate.actor = actorFor(other, candidate.actor)
             if other.Parent and d.M.Motion.GetContext(other) == context
-                and d.M.Teams.GetActorTeamName(candidate.actor) == opposing then
+                and characterTeam(other, candidate.actor) == opposing then
                 -- Require an observed slide or a live native kick charge, never proximity alone.
                 local untilTime = N.Tackle.GetSlidingUntil(other)
                 local constants = N.Tackle.Constants
+                local attack = attacks[other]
+                if attack and attack.context == context and attack.slideStarted then
+                    untilTime = math.max(finite(untilTime) and untilTime or 0, attack.slideStarted + constants.TotalMotionSeconds)
+                end
                 local age = finite(untilTime) and now - (untilTime - constants.TotalMotionSeconds) or nil
                 local hitboxEndsAt = constants.HitboxDelaySeconds + constants.HitboxSeconds
                 local sliding = age ~= nil and age >= 0 and age <= hitboxEndsAt
-                local kick = kickWindow(candidate)
+                -- Do not attach an old packet's direction to a newer replicated slide.
+                local slideDirection = sliding and attack and attack.context == context and attack.slideStarted
+                    and math.abs(untilTime - (attack.slideStarted + constants.TotalMotionSeconds)) < 1e-4
+                    and attack.slideDirection or nil
+                local kick = kickWindow(candidate, kickHorizon)
                 if not sliding and not kick then continue end
+                if sliding then lastScan.activeSlides += 1 end
+                if kick then lastScan.activeKicks += 1 end
                 local hum = other:FindFirstChildOfClass("Humanoid")
                 local otherRoot = other:FindFirstChild("HumanoidRootPart")
                 if hum and hum.Health > 0 and otherRoot then
@@ -7292,25 +8007,44 @@ local function createStrikerMisc(d)
                     local otherVelocity = d.M.Motion.GetVelocity(other) or otherRoot.AssemblyLinearVelocity
                     if vector(otherCF.Position) and vector(otherVelocity)
                         and (otherCF.Position - ownCF.Position).Magnitude <= C.Range then
-                        local relative = flat(ownCF.Position - otherCF.Position)
-                        local relativeVelocity = flat(velocity - otherVelocity)
-                        local closingSpeed = relative.Magnitude > 1e-4
-                            and relativeVelocity:Dot(relative.Unit) or 0
-                        local eta = sliding and contactTime(ownCF, velocity, otherCF, otherVelocity, age) or nil
-                        local kickEta = kick and kickContactTime(ownCF, velocity, otherCF, otherVelocity, kick.first) or nil
-                        -- A moving attacker can cross the tackle box faster than a static-distance
-                        -- check suggests. Keep the native hitbox result authoritative, but use
-                        -- relative motion to discard obviously receding contacts.
-                        if closingSpeed < -8 and not sliding then kickEta = nil end
+                        local observedPosition = otherCF.Position
+                        local displayLead
+                        otherCF, displayLead = alignDisplayedMotion(other, otherCF, otherVelocity, sliding and age or nil, slideDirection)
+                        if displayLead > 0 then stats.motionAligned += 1 end
+                        lastScan.maximumDisplayLead = math.max(lastScan.maximumDisplayLead, displayLead)
+                        local uncertainPosition = displayLead > 0 and observedPosition or nil
+                        local eta = sliding and contactTime(ownCF, velocity, otherCF, otherVelocity, age, slideDirection, uncertainPosition, root.Size, tackleHorizon) or nil
+                        local kickEta = kick and kickContactTime(ownCF, velocity, otherCF, otherVelocity, kick.first, kick.direction, uncertainPosition, root.Size, kickHorizon) or nil
                         local reason = "tackle"
                         if kickEta and (not eta or kickEta < eta) then eta, reason = kickEta, "kick" end
                         local distance = flat(otherCF.Position - ownCF.Position).Magnitude
+                        local observedDistance = flat(observedPosition - ownCF.Position).Magnitude
+                        if not lastScan.nearestThreat or observedDistance < lastScan.nearestThreat.observedDistance then
+                            -- One bounded, read-only sample makes future misses diagnosable
+                            -- without inferring exact geometry from a video or contact count.
+                            lastScan.nearestThreat = { target = other.Name, observedDistance = observedDistance,
+                                alignedDistance = distance, displayLeadSeconds = displayLead,
+                                poseShiftStuds = (otherCF.Position - observedPosition).Magnitude,
+                                slideAgeSeconds = sliding and age or nil,
+                                hitboxRemainingSeconds = sliding and hitboxEndsAt - age or nil,
+                                kickEarliestReleaseSeconds = kick and kick.first or nil,
+                                predictedContactSeconds = eta, contactPredicted = eta ~= nil,
+                                ownPosition = { ownCF.Position.X, ownCF.Position.Y, ownCF.Position.Z },
+                                ownVelocity = { velocity.X, velocity.Y, velocity.Z },
+                                observedPosition = { observedPosition.X, observedPosition.Y, observedPosition.Z },
+                                alignedPosition = { otherCF.Position.X, otherCF.Position.Y, otherCF.Position.Z },
+                                opponentVelocity = { otherVelocity.X, otherVelocity.Y, otherVelocity.Z },
+                                observedFacing = { otherCF.LookVector.X, otherCF.LookVector.Y, otherCF.LookVector.Z },
+                                slideDirection = slideDirection and { slideDirection.X, slideDirection.Y, slideDirection.Z } or nil,
+                                kickDirection = kick and kick.direction and { kick.direction.X, kick.direction.Y, kick.direction.Z } or nil }
+                        end
+                        if eta then lastScan.contacts += 1 end
                         if eta and (not best or eta < best.eta or eta == best.eta and (distance or math.huge) < (best.distance or math.huge)) then
                             best = { character = other, eta = eta, distance = distance, reason = reason,
                                 tackleAge = reason == "tackle" and age or nil,
                                 hitboxRemaining = reason == "tackle" and hitboxEndsAt - age or nil,
                                 kickChargeFill = reason == "kick" and kick.fill or nil,
-                                earliestRelease = reason == "kick" and kick.first or nil }
+                                earliestRelease = reason == "kick" and kick.first or nil, displayLead = displayLead }
                         end
                     end
                 end
@@ -7327,6 +8061,8 @@ local function createStrikerMisc(d)
         local attempt = { target = best.character.Name, contactSeconds = best.eta, distance = best.distance, reason = best.reason,
             tackleAgeSeconds = best.tackleAge, hitboxRemainingSeconds = best.hitboxRemaining,
             kickChargeFill = best.kickChargeFill, earliestReleaseSeconds = best.earliestRelease,
+            displayLeadSeconds = best.displayLead,
+            networkLeadSeconds = lead,
             serverConfirmed = false }
         if d.evaluation then
             d.evaluation.Dribble(attempt, function() d.M.Dodge.HandleInputBegan(input, false) end, best.character)
@@ -7335,6 +8071,7 @@ local function createStrikerMisc(d)
         end
         local started = d.M.Dodge.IsDribbling() == true
         if started then
+            pickupWindow = nil
             stats.started += 1
             if best.reason == "kick" then stats.kickTriggers += 1 else stats.tackleTriggers += 1 end
         else
@@ -7344,6 +8081,28 @@ local function createStrikerMisc(d)
         attempt.localStarted = started
         recent[#recent + 1] = attempt
         if #recent > 8 then table.remove(recent, 1) end
+    end
+    local function runScan()
+        queuedScan = nil
+        local start = os.clock()
+        scanning = true
+        local succeeded, tickError = pcall(tick)
+        scanning = false
+        stats.maxTickMs = math.max(stats.maxTickMs, (os.clock() - start) * 1000)
+        if not succeeded then stopDribbleWatch(tickError) end
+    end
+    requestScan = function()
+        if queuedScan or not (alive and A.AutoDribble and d.alive()) then return end
+        local ticket = {}
+        queuedScan = ticket
+        task.defer(function()
+            if queuedScan ~= ticket or not (alive and A.AutoDribble and d.alive()) then return end
+            -- Evaluate every attacker using the latest packet batch. Coalesce
+            -- simultaneous starts/cancellations and never dispatch inside a
+            -- native ownership callback or recursively from our own input.
+            nextTick = os.clock() + C.Interval
+            runScan()
+        end)
     end
     -- Read only; used at 10 Hz exclusively during an explicit comparison run.
     function A.ObserveDribbleGate()
@@ -7383,22 +8142,35 @@ local function createStrikerMisc(d)
         A.AutoDribble, A.DribbleStatus, nextTick = true, "WATCHING", 0
         local connected, connectionError = pcall(function()
             watchNativeOwner()
-            inputConnection = d.Input.InputBegan:Connect(function(input)
+            watchPickupReadiness()
+            watchCharacters()
+            watchAttacks()
+            inputConnection = d.Input.InputBegan:Connect(function(input, processed)
                 if not A.AutoDribble then return end
                 local checked, inputError = pcall(function()
+                    -- A GUI click can share the Kick binding without starting
+                    -- a native strike. Do not give it a manual-action grace.
+                    if N.Input.ShouldIgnoreKeybind(processed)
+                        or (d.ignoreManualInput and d.ignoreManualInput(input)) then return end
                     for _, name in ipairs({ "Kick", "Pass", "Lob", "RainbowFlick", "Dribble", "Tackle", "Jump" }) do
-                        if N.Controls.IsInput(name, input) then manualUntil = os.clock() + C.ManualGrace; break end
+                        if N.Controls.IsInput(name, input) then
+                            manualUntil = os.clock() + C.ManualGrace
+                            local ch = d.Player.Character
+                            manualHadBall = ch ~= nil and ownsBall(ch)
+                            break
+                        end
                     end
                 end)
                 if not checked then stopDribbleWatch(inputError) end
             end)
             heartbeat = d.Run.Heartbeat:Connect(function()
-                if not (alive and A.AutoDribble and d.alive()) or os.clock() < nextTick then return end
-                nextTick = os.clock() + C.Interval
                 local start = os.clock()
-                local succeeded, tickError = pcall(tick)
-                stats.maxTickMs = math.max(stats.maxTickMs, (os.clock() - start) * 1000)
-                if not succeeded then stopDribbleWatch(tickError) end
+                if not (alive and A.AutoDribble and d.alive()) or start < nextTick then return end
+                -- Keep the deadline cadence through uneven mobile frames. Never
+                -- run a catch-up loop or send multiple requests in one heartbeat.
+                if nextTick == 0 then nextTick = start + C.Interval
+                else nextTick += (math.floor((start - nextTick) / C.Interval) + 1) * C.Interval end
+                runScan()
             end)
         end)
         if not connected then stopDribbleWatch(connectionError); return false end
@@ -7424,9 +8196,6 @@ local function createStrikerMisc(d)
             if value and not N.Guard then N.Guard = d.load("Modules.Characters.LocalMovementGuard") end
             if value then
                 N.Placement = N.Placement or d.load("Modules.Characters.CharacterPlacement")
-                N.StaminaRules = N.StaminaRules or d.load("Modules.Actions.Sprint")
-                assert(type(N.Sprint.GetStamina) == "function" and type(N.Sprint.SpendStamina) == "function"
-                    and type(N.StaminaRules.GetStaminaMultiplier) == "function", "Native stamina recovery unavailable")
             end
             if value and (request ~= staminaGeneration or not alive or not d.alive()) then return end
             if value then startStaminaWatch() end
@@ -7451,7 +8220,6 @@ local function createStrikerMisc(d)
         end
         if value and (request ~= staminaGeneration or not alive or not d.alive()) then return false end
         A.InfiniteStamina = value
-        if value then correctionPending, nextStaminaRetry = nil, 0 end
         A.StaminaStatus = value and "LOCAL ON" or "OFF"
         return true
     end
@@ -7463,14 +8231,20 @@ local function createStrikerMisc(d)
     function A.Debug()
         return { autoDribble = A.AutoDribble, infiniteStamina = A.InfiniteStamina,
             dribbleStatus = A.DribbleStatus, staminaStatus = A.StaminaStatus,
-            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.6",
+            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.17.6",
             dribbleTrigger = "incoming_tackle_or_kick", tackleLookaheadSeconds = C.Lookahead,
             kickLookaheadSeconds = C.KickLookahead,
-            correctionFallback = true, positionRepairFallback = true,
+            correctionFallback = false, positionRepairFallback = false, correctionPolicy = "observe_only",
             lastCorrection = lastCorrection and table.clone(lastCorrection) or nil,
+            inputMode = N.Input and type(N.Input.GetLastInputType) == "function" and N.Input.GetLastInputType() or nil,
+            cooldownRemaining = N.Controls and type(N.Controls.GetCooldownRemaining) == "function"
+                and N.Controls.GetCooldownRemaining("Dribble") or nil,
+            blockedBy = table.clone(blockedBy), recentGates = table.clone(recentGates),
+            lastScan = lastScan and table.clone(lastScan) or nil,
             stats = table.clone(stats), recent = table.clone(recent) }
     end
-    if d.test then A.Test = { contactTime = contactTime, segmentBox = segmentBox, kickContactTime = kickContactTime } end
+    if d.test then A.Test = { contactTime = contactTime, segmentBox = segmentBox, kickContactTime = kickContactTime,
+        alignDisplayedMotion = alignDisplayedMotion } end
     return A
 end
 
@@ -8009,7 +8783,7 @@ for _, remote in ipairs(BallRemotes:GetChildren()) do
 end
 local EVALUATION = createStrikerEvaluation({
     M = M, Player = LocalPlayer, Players = Players, Run = RunService, State = StateRemote,
-    build = "Dmc 0.23 startup and shot selection",
+    build = "Dmc 0.26 client stamina restored",
     sessionId = game:GetService("HttpService"):GenerateGUID(false),
     CommandRemotes = evaluationRemotes, alive = function() return S.alive end,
     timestamp = function() return DateTime.now().UnixTimestampMillis end,
@@ -8044,7 +8818,7 @@ ENV.DmcMarkTrial = function(kind, outcomes, trialId)
 end
 ENV.DmcMarkOutcome = function(kind, outcome, id)
     local ok, detail = EVALUATION.Mark(kind, outcome, id)
-    print("[Dmc Evaluation]", ok and "Outcome recorded" or "Not recorded", detail)
+    print("[Banyu Evaluation]", ok and "Outcome recorded" or "Not recorded", detail)
     return ok, detail
 end
 local STR = createStriker({
@@ -8064,199 +8838,47 @@ local MISC = createStrikerMisc({
     Run = RunService, Gui = game:GetService("GuiService"), load = module,
     id = game:GetService("HttpService"):GenerateGUID(false),
     alive = function() return S.alive end,
-    suspended = function() return S.uiBusy or not S.focused end, evaluation = EVALUATION,
+    -- Visual UI interactions do not suspend the defensive threat watcher.
+    -- Native text/chat, menu, strike and recovery gates still apply.
+    suspended = function() return not S.focused end, evaluation = EVALUATION,
+    ignoreManualInput = function(input) return S.isUIInput and S.isUIInput(input) or false end,
+    AttackRemotes = evaluationRemotes,
 })
+-- Auto sprint owns only the game's native button toggle.
+do
+    local sprint = createAutoSprint({
+        Player = LocalPlayer, Input = UserInputService, Run = RunService,
+        Gui = game:GetService("GuiService"), load = module,
+        alive = function() return S.alive end,
+        suspended = function() return S.uiBusy or not S.focused end,
+        changed = function(state) MISC.AutoSprint, MISC.SprintStatus = state.AutoSprint, state.Status end,
+    })
+    MISC.AutoSprint, MISC.SprintStatus = false, "OFF"
+    MISC.SetAutoSprint = sprint.SetAutoSprint
+    local originalCleanup, originalDebug = MISC.Cleanup, MISC.Debug
+    MISC.Cleanup = function()
+        local sprintCalled, sprintResult = pcall(sprint.Cleanup)
+        local miscCalled, miscResult, miscDetail = pcall(originalCleanup)
+        if not sprintCalled or sprintResult == false then return false, "Auto sprint could not be released" end
+        if not miscCalled then return false, tostring(miscResult) end
+        return miscResult, miscDetail
+    end
+    MISC.Debug = function()
+        local result = originalDebug()
+        result.autoSprint, result.sprintStatus, result.sprint = MISC.AutoSprint, MISC.SprintStatus, sprint.Debug()
+        return result
+    end
+end
+
 S.releaseMisc = MISC.Cleanup
-
---==============================================================
--- FEATURE KEYBINDS
---==============================================================
-local keybindCapture = nil
-local keybindRefreshers = {}
-
-local function keyCodeFromName(name)
-    if type(name) ~= "string" then return Enum.KeyCode.Unknown end
-    local ok, key = pcall(function() return Enum.KeyCode[name] end)
-    return ok and key or Enum.KeyCode.Unknown
-end
-
-local function keyName(key)
-    if typeof(key) ~= "EnumItem" or key.EnumType ~= Enum.KeyCode then return "None" end
-    return key.Name
-end
-
-local function setFeatureKeybind(name, key)
-    local value = keyName(key)
-    if value == "Unknown" then return false end
-    FeatureKeybinds[name] = value
-    for _, refresh in ipairs(keybindRefreshers) do pcall(refresh) end
-    return true
-end
-
-local function toggleFeatureByKey(name)
-    if name == "AutoSave" then
-        toggleEnabled(not ENV.AUTO_GK_ENABLED)
-    elseif name == "CloseRangeRush" then
-        Config.CloseRangeRush = not Config.CloseRangeRush
-        Rush.candidate = nil
-    elseif name == "HighBallJumps" then
-        Config.HighBallJumps = not Config.HighBallJumps
-    elseif name == "JumpThenDive" then
-        Config.JumpThenDive = not Config.JumpThenDive
-    elseif name == "BackwardRecovery" then
-        Config.BackwardRecovery = not Config.BackwardRecovery
-    elseif name == "PositionAssist" then
-        Config.PositionAssist = not Config.PositionAssist
-        if not Config.PositionAssist then invalidateFrame(true) end
-    elseif name == "PreShotCoverage" then
-        Config.PreShotCoverage = not Config.PreShotCoverage
-        invalidateFrame(true)
-    elseif name == "ManualMovementFirst" then
-        Config.RespectManualMovement = not Config.RespectManualMovement
-    elseif name == "BestShotAssist" then
-        STR.SetEnabled(not STR.Enabled)
-    elseif name == "FlickAssist" then
-        STR.SetFlickAssist(not STR.FlickAssist)
-    elseif name == "AutoCurve" then
-        STR.SetAutoCurve(not STR.AutoCurve)
-    elseif name == "SmartRelease" then
-        STR.SetSmartRelease(not STR.SmartRelease)
-    elseif name == "AutoDribble" then
-        MISC.SetAutoDribble(not MISC.AutoDribble)
-    elseif name == "InfiniteStamina" then
-        MISC.SetInfiniteStamina(not MISC.InfiniteStamina)
-    end
-end
-
-local keybindConnection = connect(UserInputService.InputBegan, function(input, processed)
-    if not S.alive then return end
-    if keybindCapture then
-        if input.UserInputType == Enum.UserInputType.Keyboard
-            and input.KeyCode ~= Enum.KeyCode.Unknown then
-            local capture = keybindCapture
-            keybindCapture = nil
-            setFeatureKeybind(capture, input.KeyCode)
-        elseif input.KeyCode == Enum.KeyCode.Escape then
-            keybindCapture = nil
-            for _, refresh in ipairs(keybindRefreshers) do pcall(refresh) end
-        end
-        return
-    end
-    if processed then return end
-    if input.UserInputType ~= Enum.UserInputType.Keyboard
-        or input.KeyCode == Enum.KeyCode.Unknown then return end
-    for feature, binding in pairs(FeatureKeybinds) do
-        if keyCodeFromName(binding) == input.KeyCode then
-            toggleFeatureByKey(feature)
-            break
-        end
-    end
-end)
-ENV.AutoGKKeybinds = FeatureKeybinds
 EVALUATION.ConfigureComparison(MISC.ObserveDribbleGate, function()
     return { bestShot = STR.Enabled, autoCurve = STR.AutoCurve, smartRelease = STR.SmartRelease,
         autoDribble = MISC.AutoDribble, infiniteStamina = MISC.InfiniteStamina }
 end)
 ENV.DmcMisc = MISC
-
---==============================================================
--- PERSISTENT CONFIG
---==============================================================
-local CONFIG_FILE = "AutoGK_Config.json"
-local function saveConfig()
-    if type(writefile) ~= "function" then
-        return false, "writefile unavailable"
-    end
-    local HttpService = game:GetService("HttpService")
-    local data = {
-        version = 1,
-        config = {},
-        striker = {
-            enabled = STR.Enabled,
-            autoCurve = STR.AutoCurve,
-            smartRelease = STR.SmartRelease,
-            flickAssist = STR.FlickAssist,
-            flickSmoothness = STR.FlickSmoothness,
-        },
-        misc = {
-            autoDribble = MISC.AutoDribble,
-            infiniteStamina = MISC.InfiniteStamina,
-        },
-        keybinds = table.clone(FeatureKeybinds),
-    }
-    for key, value in pairs(Config) do
-        local valueType = typeof(value)
-        if key ~= "DiveFilter" and key ~= "BackwardRecovery"
-                and valueType ~= "nil" and (valueType == "boolean" or valueType == "number" or valueType == "string") then
-            data.config[key] = value
-        end
-    end
-    local ok, encoded = pcall(HttpService.JSONEncode, HttpService, data)
-    if not ok then return false, encoded end
-    local wrote, err = pcall(writefile, CONFIG_FILE, encoded)
-    if not wrote then return false, err end
-    return true, "saved"
-end
-
-local function loadConfig()
-    if type(isfile) ~= "function" or type(readfile) ~= "function" or not isfile(CONFIG_FILE) then
-        return false, "no saved config"
-    end
-    local HttpService = game:GetService("HttpService")
-    local ok, raw = pcall(readfile, CONFIG_FILE)
-    if not ok then return false, raw end
-    local decodedOk, data = pcall(HttpService.JSONDecode, HttpService, raw)
-    if not decodedOk or type(data) ~= "table" then return false, "invalid config" end
-
-    if type(data.config) == "table" then
-        for key, value in pairs(data.config) do
-            if key ~= "DiveFilter" and key ~= "BackwardRecovery"
-                and Config[key] ~= nil
-                and (typeof(value) == "boolean" or typeof(value) == "number" or typeof(value) == "string") then
-                Config[key] = value
-            end
-        end
-    end
-
-    local st = data.striker
-    if type(st) == "table" then
-        if st.enabled ~= nil then STR.SetEnabled(st.enabled == true) end
-        if st.autoCurve ~= nil then STR.SetAutoCurve(st.autoCurve == true) end
-        if st.smartRelease ~= nil then STR.SetSmartRelease(st.smartRelease == true) end
-        if st.flickAssist ~= nil then STR.SetFlickAssist(st.flickAssist == true) end
-        if st.flickSmoothness ~= nil then STR.SetFlickSmoothness(st.flickSmoothness) end
-    end
-
-    local mi = data.misc
-    if type(mi) == "table" then
-        if mi.autoDribble ~= nil then MISC.SetAutoDribble(mi.autoDribble == true) end
-        if mi.infiniteStamina ~= nil then MISC.SetInfiniteStamina(mi.infiniteStamina == true) end
-    end
-    if type(data.keybinds) == "table" then
-        local legacyDefaults = {
-            AutoSave = "F1", CloseRangeRush = "F2", HighBallJumps = "F3",
-            JumpThenDive = "F4", BackwardRecovery = "F5", PositionAssist = "F6",
-            PreShotCoverage = "F7", ManualMovementFirst = "F8", BestShotAssist = "F9",
-            FlickAssist = "F10", AutoCurve = "F11", SmartRelease = "F12",
-            AutoDribble = "Z", InfiniteStamina = "X",
-        }
-        for name, key in pairs(data.keybinds) do
-            if FeatureKeybinds[name] ~= nil and type(key) == "string" then
-                -- Migrate the old built-in defaults to unbound; keep player-custom keys.
-                FeatureKeybinds[name] = legacyDefaults[name] == key and "" or key
-            end
-        end
-    end
-    return true, "loaded"
-end
-
-ENV.AutoGKSaveConfig = saveConfig
-ENV.AutoGKLoadConfig = loadConfig
-loadConfig()
-
 ENV.DmcMiscDebug = function()
     local result = MISC.Debug()
-    print("[Dmc Misc]", game:GetService("HttpService"):JSONEncode(result))
+    print("[Banyu Misc]", game:GetService("HttpService"):JSONEncode(result))
     return result
 end
 
@@ -8295,16 +8917,53 @@ do
         hover = Color3.fromRGB(39, 37, 30),
         pressed = Color3.fromRGB(53, 47, 32),
         stroke = Color3.fromRGB(49, 47, 39),
-        text = Color3.fromRGB(233, 231, 220),
-        muted = Color3.fromRGB(145, 144, 131),
+        text = Color3.fromRGB(242, 243, 240),
+        muted = Color3.fromRGB(178, 181, 175),
         accent = Color3.fromRGB(222, 193, 115),
         accentDim = Color3.fromRGB(131, 111, 61),
         active = Color3.fromRGB(43, 39, 27),
     }
 
+    local readableFont = Font.new(Font.fromEnum(Enum.Font.Nunito).Family, Enum.FontWeight.SemiBold, Enum.FontStyle.Normal)
+    local themeBindings = {}
+    local function trackTheme(object, properties)
+        local bindings = themeBindings[object] or {}
+        for _, property in ipairs({ "BackgroundColor3", "TextColor3", "PlaceholderColor3", "Color", "ScrollBarImageColor3" }) do
+            local value = properties[property]
+            if value ~= nil then
+                bindings[property] = nil
+                for key, color in pairs(C) do
+                    if value == color then bindings[property] = key; break end
+                end
+            end
+        end
+        themeBindings[object] = bindings
+    end
+    local function setThemed(object, property, value)
+        trackTheme(object, { [property] = value })
+        object[property] = value
+    end
+    local function setPalette(hex)
+        local r, g, b = tonumber(hex:sub(1, 2), 16), tonumber(hex:sub(3, 4), 16), tonumber(hex:sub(5, 6), 16)
+        C.accent = Color3.fromRGB(r, g, b)
+        if hex == "DEC173" then
+            C.accentDim, C.active = Color3.fromRGB(131, 111, 61), Color3.fromRGB(43, 39, 27)
+            C.hover, C.pressed, C.stroke = Color3.fromRGB(39, 37, 30), Color3.fromRGB(53, 47, 32), Color3.fromRGB(49, 47, 39)
+        else
+            local function blend(base, weight)
+                return Color3.fromRGB(math.floor(base + (r - base) * weight + 0.5),
+                    math.floor(base + (g - base) * weight + 0.5), math.floor(base + (b - base) * weight + 0.5))
+            end
+            C.accentDim, C.active = blend(16, 0.55), blend(16, 0.13)
+            C.hover, C.pressed, C.stroke = blend(24, 0.08), blend(24, 0.16), blend(35, 0.09)
+        end
+    end
+
     local function create(class, properties, parent)
         local object = Instance.new(class)
         for key, value in pairs(properties) do object[key] = value end
+        if properties.Font == Enum.Font.Nunito then object.FontFace = readableFont end
+        trackTheme(object, properties)
         object.Parent = parent
         return object
     end
@@ -8332,7 +8991,7 @@ do
 
     local function text(parent, value, size, properties)
         local p = {
-            Text = value, TextSize = size, Font = Enum.Font.Gotham,
+            Text = value, TextSize = math.max(13, size + 3), Font = Enum.Font.Nunito,
             TextColor3 = C.text, BackgroundTransparency = 1,
             TextXAlignment = Enum.TextXAlignment.Left,
             BorderSizePixel = 0,
@@ -8343,7 +9002,7 @@ do
 
     local function button(parent, properties)
         local p = {
-            Text = "", TextSize = 12, Font = Enum.Font.GothamMedium,
+            Text = "", TextSize = 14, Font = Enum.Font.FredokaOne,
             TextColor3 = C.text, BackgroundColor3 = C.control,
             BorderSizePixel = 0, AutoButtonColor = false,
             Modal = false, Selectable = true,
@@ -8352,8 +9011,22 @@ do
         return round(create("TextButton", p, parent), 5)
     end
 
+    local function chevron(parent, name, x, y)
+        local icon = frame(parent, name, x, y, 14, 14)
+        icon.BackgroundTransparency, icon.Visible = 1, true
+        icon.ZIndex = parent.ZIndex + 1
+        local white = Color3.fromRGB(255, 255, 255)
+        local left = round(frame(icon, "Left", 1, 6, 8, 3, white), 2)
+        local right = round(frame(icon, "Right", 6, 6, 8, 3, white), 2)
+        left.Rotation, right.Rotation = 45, -45
+        left.ZIndex, right.ZIndex = icon.ZIndex + 1, icon.ZIndex + 1
+        left.BackgroundTransparency, right.BackgroundTransparency = 0, 0
+        themeBindings[left].BackgroundColor3, themeBindings[right].BackgroundColor3 = nil, nil
+        return icon
+    end
+
     local Gui = create("ScreenGui", {
-        Name = "AutoGKInterface", ResetOnSpawn = false, Enabled = not SafeConfig.UIStartHidden,
+        Name = "AutoGKInterface", ResetOnSpawn = false, Enabled = true,
         IgnoreGuiInset = true, DisplayOrder = 20,
         ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
     }, PlayerGui)
@@ -8374,7 +9047,7 @@ do
     header.Active = true
     text(header, "Banyu", 13, {
         Name = "PageTitle", Size = UDim2.fromScale(1, 1),
-        Font = Enum.Font.GothamBold,
+        Font = Enum.Font.FredokaOne,
     })
     local minimize = button(panel, {
         Name = "Minimize", Text = "-", TextSize = 18,
@@ -8387,15 +9060,9 @@ do
     local tabBar = frame(panel, "Tabs", 12, 44, 292, 26)
     tabBar.BackgroundTransparency = 1
     -- STR is independent of the goalkeeper automation toggle.
-    local strikerContent = create("ScrollingFrame", {
-        Name = "STRContent", Position = UDim2.fromOffset(12, 76),
-        Size = UDim2.fromOffset(292, 406), BackgroundTransparency = 1,
-        BorderSizePixel = 0, ClipsDescendants = true, Visible = false,
-        ScrollingDirection = Enum.ScrollingDirection.Y,
-        ScrollBarThickness = 2, ScrollBarImageColor3 = C.accentDim,
-        CanvasSize = UDim2.fromOffset(292, 735),
-    }, panel)
-    strikerContent.AutomaticCanvasSize = Enum.AutomaticSize.None
+    local strikerContent = frame(panel, "STRContent", 12, 76, 292, 403)
+    strikerContent.BackgroundTransparency = 1
+    strikerContent.Visible = false
     local live = round(frame(panel, "LiveStatus", 12, 76, 292, 28, C.surface), 5)
     local dot = round(frame(live, "StatusDot", 10, 11, 6, 6, C.muted), 3)
     local stateText = text(live, "STARTING", 10, {
@@ -8417,23 +9084,47 @@ do
     local refreshers = {}
     local animations = {}
     local animationEnds = {}
+    local animationGoals = {}
     local dropdowns = {}
     local expanded = nil
     local dragging = false
+    local rangeInput = nil
     local minimized = false
     local activeTab = "GK"
+    local settingsBusy = false
+    local editingField = nil
+    local colorPickerOpen = false
+    local closeColorPicker: (() -> ())? = nil
+    -- Hit-test the current visible panel rather than hover state: the global
+    -- InputBegan observer may run before a control's own callback.
+    S.isUIInput = function(input)
+        if not S.alive or not Gui.Parent or not Gui.Enabled or not panel.Visible then return false end
+        local kind = input.UserInputType
+        if kind ~= Enum.UserInputType.MouseButton1 and kind ~= Enum.UserInputType.MouseButton2
+            and kind ~= Enum.UserInputType.MouseButton3 and kind ~= Enum.UserInputType.Touch then return false end
+        local point, position, size = input.Position, panel.AbsolutePosition, panel.AbsoluteSize
+        return point.X >= position.X and point.X < position.X + size.X
+            and point.Y >= position.Y and point.Y < position.Y + size.Y
+    end
+    local function updateUIBusy()
+        S.uiBusy = dragging or rangeInput ~= nil or expanded ~= nil or settingsBusy or editingField ~= nil or colorPickerOpen
+    end
     local activeBody = nil
     local order = 0
+    local keybinds = { AutoGK = nil, BestShot = nil }
+    local keybindCapture = nil
 
     local function cancelAnimation(object)
         if animationEnds[object] then animationEnds[object]:Disconnect() end
         animationEnds[object] = nil
         if animations[object] then animations[object]:Cancel() end
         animations[object] = nil
+        animationGoals[object] = nil
     end
 
     local function animate(object, goals, immediate, duration, onComplete)
         cancelAnimation(object)
+        trackTheme(object, goals)
         if immediate then
             for k, v in pairs(goals) do object[k] = v end
             if onComplete then onComplete() end
@@ -8442,6 +9133,7 @@ do
         local tween = TweenService:Create(object,
             TweenInfo.new(duration or 0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), goals)
         animations[object] = tween
+        animationGoals[object] = goals
         animationEnds[object] = tween.Completed:Connect(function(playbackState)
             -- Cancellation also fires Completed; only the current finished tween owns this callback.
             if animations[object] ~= tween then return end
@@ -8449,6 +9141,12 @@ do
             if connection then connection:Disconnect() end
             animationEnds[object] = nil
             animations[object] = nil
+            animationGoals[object] = nil
+            if playbackState == Enum.PlaybackState.Completed and S.alive then
+                for property, key in pairs(themeBindings[object] or {}) do
+                    if goals[property] ~= nil then object[property] = C[key] end
+                end
+            end
             if playbackState == Enum.PlaybackState.Completed and S.alive and onComplete then
                 onComplete()
             end
@@ -8505,6 +9203,7 @@ do
     hover(unload)
 
     local function closeDropdown(immediate)
+        rangeInput = nil
         local previous = expanded
         expanded = nil
         if immediate then
@@ -8512,7 +9211,14 @@ do
         elseif previous then
             previous.setOpen(false, false)
         end
-        S.uiBusy = dragging
+        if editingField then
+            local field = editingField
+            editingField = nil
+            field:ReleaseFocus()
+        end
+        local closePicker = closeColorPicker
+        if closePicker then closePicker() end
+        updateUIBusy()
     end
     S.closeDropdown = function() closeDropdown(true) end
 
@@ -8530,7 +9236,7 @@ do
         card.LayoutOrder = name == "AUTOMATION" and 1 or 2
         text(card, name, 9, {
             Position = UDim2.fromOffset(0, 0), Size = UDim2.new(1, 0, 0, 16),
-            Font = Enum.Font.GothamMedium, TextColor3 = C.accentDim,
+            Font = Enum.Font.FredokaOne, TextColor3 = C.muted,
         })
         activeBody = frame(card, "Options", 0, 22, 0, 0)
         activeBody.Size = UDim2.new(1, 0, 0, 0)
@@ -8542,55 +9248,51 @@ do
         order = 0
     end
 
-    local function keybindRow(label, featureName)
-        order = order + 1
-        local row = frame(activeBody, label, 0, 0, 0, 32)
-        row.BackgroundTransparency = 1
-        row.Size = UDim2.new(1, 0, 0, 32)
-        row.LayoutOrder = order
-        text(row, label, 11, {
-            Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -116, 1, 0),
-            TextColor3 = C.muted,
-        })
-        local bind = button(row, {
-            Name = "Keybind", Position = UDim2.new(1, -96, 2, 0),
-            Size = UDim2.fromOffset(84, 28),
-        })
-        bind.Position = UDim2.new(1, -96, 0, 2)
-        stroke(bind)
-        local previous = nil
-        local function refresh(immediate)
-            local textValue = keybindCapture == featureName and "PRESS KEY" or (FeatureKeybinds[featureName] or "None")
-            if textValue == previous then return end
-            previous = textValue
-            bind.Text = textValue
-            bind.TextSize = 9
-            bind.TextColor3 = keybindCapture == featureName and C.accent or C.text
-            if immediate then bind.BackgroundColor3 = C.control end
-        end
-        hover(bind)
-        connect(bind.Activated, function()
-            if not S.alive then return end
-            closeDropdown()
-            keybindCapture = featureName
-            for _, repaint in ipairs(keybindRefreshers) do pcall(repaint) end
-        end)
-        refresh(true)
-        table.insert(keybindRefreshers, function() refresh(false) end)
-    end
-
-    local function toggle(label, getter, setter)
+    local function toggle(label, getter, setter, bindName)
         order = order + 1
         local control = button(activeBody, {
             Name = label, Size = UDim2.new(1, 0, 0, 32), LayoutOrder = order,
         })
         text(control, label, 11, {
-            Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -82, 1, 0),
+            Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, bindName and -110 or -82, 1, 0),
         })
         local state = text(control, "", 9, {
-            Name = "Value", Position = UDim2.new(1, -69, 0, 0),
+            Name = "Value", Position = UDim2.new(1, bindName and -101 or -69, 0, 0),
             Size = UDim2.fromOffset(30, 32), TextXAlignment = Enum.TextXAlignment.Right,
         })
+        if bindName then
+            local keyBox = button(control, {
+                Name = "Keybind", Text = "...", TextSize = 10,
+                Position = UDim2.new(1, -66, 0, 5), Size = UDim2.fromOffset(28, 22),
+                BackgroundColor3 = C.surface,
+            })
+            stroke(keyBox, C.accentDim)
+            hover(keyBox)
+            local function drawKey()
+                local key = keybinds[bindName]
+                keyBox.Text = key and key.Name or "..."
+                keyBox.TextColor3 = key and C.text or C.muted
+            end
+            connect(keyBox.Activated, function()
+                if not S.alive then return end
+                keybindCapture = bindName
+                keyBox.Text = "..."
+                keyBox.TextColor3 = C.accent
+            end)
+            connect(UserInputService.InputBegan, function(input, processed)
+                if not S.alive or not keybindCapture or processed then return end
+                if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+                if input.KeyCode == Enum.KeyCode.Escape then
+                    keybindCapture = nil
+                    drawKey()
+                    return
+                end
+                keybinds[keybindCapture] = input.KeyCode
+                keybindCapture = nil
+                drawKey()
+            end)
+            drawKey()
+        end
         -- One solid square owns the fill; no rounded mask or inset layer leaves dark corner cutouts.
         local box = frame(control, "Checkbox", 0, 7, 18, 18, C.control)
         box.Position = UDim2.new(1, -30, 0, 7)
@@ -8622,64 +9324,19 @@ do
         end)
         refresh(true)
         table.insert(refreshers, function() refresh(false) end)
-    end
 
-    local function slider(label, getter, setter, minimum, maximum)
-        order = order + 1
-        local row = frame(activeBody, label, 0, 0, 0, 40)
-        row.BackgroundTransparency = 1
-        row.Size = UDim2.new(1, 0, 0, 40)
-        row.LayoutOrder = order
-        text(row, label, 11, {
-            Position = UDim2.fromOffset(12, 0), Size = UDim2.fromOffset(155, 18),
-            TextColor3 = C.muted,
-        })
-        local value = text(row, "", 10, {
-            Position = UDim2.new(1, -48, 0, 0), Size = UDim2.fromOffset(36, 18),
-            TextXAlignment = Enum.TextXAlignment.Right, TextColor3 = C.accent,
-        })
-        local track = frame(row, "Track", 0, 24, 0, 5, C.control)
-        track.Size = UDim2.new(1, -24, 0, 5)
-        track.Position = UDim2.fromOffset(12, 25)
-        local fill = frame(track, "Fill", 0, 0, 0, 5, C.accent)
-        local knob = frame(track, "Knob", 0, -4, 12, 13, C.accent)
-        knob.AnchorPoint = Vector2.new(0.5, 0)
-        local dragging = false
-        local function applyAt(x)
-            local left = track.AbsolutePosition.X
-            local width = math.max(track.AbsoluteSize.X, 1)
-            local t = math.clamp((x - left) / width, 0, 1)
-            local v = math.floor(minimum + (maximum - minimum) * t + 0.5)
-            setter(v)
+        if bindName then
+            connect(UserInputService.InputBegan, function(input, processed)
+                if not S.alive or processed or keybindCapture then return end
+                if input.UserInputType ~= Enum.UserInputType.Keyboard
+                    or UserInputService:GetFocusedTextBox() then return end
+                if keybinds[bindName] and input.KeyCode == keybinds[bindName] then
+                    setter(not getter())
+                    refresh(false)
+                end
+            end)
         end
-        local function refresh()
-            local v = math.clamp(math.floor(tonumber(getter()) or minimum), minimum, maximum)
-            local t = (v - minimum) / math.max(maximum - minimum, 1)
-            value.Text = tostring(v)
-            fill.Size = UDim2.new(t, 0, 0, 5)
-            knob.Position = UDim2.new(t, 0, 0, -4)
-        end
-        connect(track.InputBegan, function(input)
-            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-                dragging = true
-                applyAt(input.Position.X)
-                refresh()
-            end
-        end)
-        connect(UserInputService.InputChanged, function(input)
-            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-                applyAt(input.Position.X)
-                refresh()
-            end
-        end)
-        connect(UserInputService.InputEnded, function(input)
-            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-                dragging = false
-            end
-        end)
-        hover(row)
-        refresh()
-        table.insert(refreshers, refresh)
+        return refresh
     end
 
     local function dropdown(label, choices, getter, setter)
@@ -8703,11 +9360,8 @@ do
             Name = "SelectedValue", Position = UDim2.fromOffset(12, 0),
             Size = UDim2.new(1, -45, 1, 0),
         })
-        local arrow = frame(selectButton, "Arrow", 0, 9, 12, 12)
-        arrow.Position = UDim2.new(1, -27, 0, 9)
-        arrow.BackgroundTransparency = 1
-        frame(arrow, "Left", 1, 5, 6, 2, C.accent).Rotation = 45
-        frame(arrow, "Right", 5, 5, 6, 2, C.accent).Rotation = -45
+        local arrow = chevron(selectButton, "Arrow", 0, 8)
+        arrow.Position = UDim2.new(1, -28, 0, 8)
         local menuHeight = #choices * 32 - 4
         local menu = frame(row, "Choices", 0, 38, 0, menuHeight)
         menu.Size = UDim2.new(1, 0, 0, menuHeight)
@@ -8723,6 +9377,7 @@ do
             if open then menu.Visible = true end
             for _, item in ipairs(items) do
                 item.button.Interactable = open
+                item.marker.Visible = getter() == item.value
                 if not open then item.reset() end
             end
             animate(arrow, { Rotation = open and 180 or 0 }, immediate, 0.18)
@@ -8735,16 +9390,17 @@ do
                 end)
         end
         table.insert(dropdowns, entry)
-        local previousValue = nil
+        local previousValue, selectionInitialized = nil, false
         local function refresh(immediate)
             local value = getter()
-            if value == previousValue then return end
-            previousValue = value
+            if selectionInitialized and value == previousValue then return end
+            previousValue, selectionInitialized = value, true
             for _, item in ipairs(items) do
                 local active = value == item.value
                 if active then selected.Text = item.label end
-                item.button.Text = (active and "  >  " or "      ") .. item.label
-                item.button.TextColor3 = active and C.accent or C.text
+                item.text.Text = item.label
+                item.marker.Visible = active
+                setThemed(item.text, "TextColor3", active and C.accent or C.text)
                 item.repaint(immediate)
             end
         end
@@ -8754,11 +9410,17 @@ do
                 Size = UDim2.new(1, 0, 0, 28), LayoutOrder = index,
                 Interactable = false,
             })
+            local optionText = text(option, choice.label, 11, {
+                Name = "Label", Position = UDim2.fromOffset(34, 0), Size = UDim2.new(1, -44, 1, 0),
+                TextTruncate = Enum.TextTruncate.AtEnd,
+            })
+            local marker = chevron(option, "SelectedChevron", 10, 7)
+            marker.Rotation = -90
             local repaint, reset = hover(option, function()
                 return getter() == choice.value and C.active or C.control
             end)
             table.insert(items, {
-                button = option, value = choice.value, label = choice.label,
+                button = option, text = optionText, marker = marker, value = choice.value, label = choice.label,
                 repaint = repaint, reset = reset,
             })
             connect(option.Activated, function()
@@ -8792,9 +9454,9 @@ do
         function()
             return ENV.AUTO_GK_ENABLED
         end,
-        toggleEnabled
+        toggleEnabled,
+        "AutoGK"
     )
-    keybindRow("Auto save key", "AutoSave")
 
     toggle(
         "Close-range rush",
@@ -8808,7 +9470,6 @@ do
             Rush.candidate = nil
         end
     )
-    keybindRow("Close rush key", "CloseRangeRush")
 
     toggle(
         "High-ball jumps",
@@ -8821,7 +9482,6 @@ do
             Config.HighBallJumps = value
         end
     )
-    keybindRow("High-ball key", "HighBallJumps")
 
     toggle(
         "Jump then dive",
@@ -8834,7 +9494,6 @@ do
             Config.JumpThenDive = value
         end
     )
-    keybindRow("Jump dive key", "JumpThenDive")
 
     dropdown(
         "Dive direction",
@@ -8844,7 +9503,7 @@ do
             { value = "FORWARD", label = "Forward" },
             { value = "LEFT", label = "Left" },
             { value = "RIGHT", label = "Right" },
-            { value = "SIDES", label = "SafeAuto" },
+            { value = "SIDES", label = "Sides" },
         },
 
         function()
@@ -8869,7 +9528,6 @@ do
             Config.BackwardRecovery = value
         end
     )
-    keybindRow("Back recovery key", "BackwardRecovery")
 
     section("POSITIONING")
 
@@ -8888,7 +9546,6 @@ do
             end
         end
     )
-    keybindRow("Position assist key", "PositionAssist")
 
     toggle(
         "Pre-shot coverage",
@@ -8902,7 +9559,6 @@ do
             invalidateFrame(true)
         end
     )
-    keybindRow("Coverage key", "PreShotCoverage")
 
     dropdown(
         "Position mode",
@@ -8936,103 +9592,635 @@ do
             Config.RespectManualMovement = value
         end
     )
-    keybindRow("Manual movement key", "ManualMovementFirst")
 
     local gkRefresherCount = #refreshers
-    local shootingSection = frame(strikerContent, "Shooting", 0, 0, 292, 345)
+    local shootingSection = frame(strikerContent, "Shooting", 0, 0, 292, 179)
     shootingSection.BackgroundTransparency = 1
     text(shootingSection, "SHOOTING", 9, {
         Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(292, 16),
-        Font = Enum.Font.GothamMedium, TextColor3 = C.accentDim,
+        Font = Enum.Font.FredokaOne, TextColor3 = C.muted,
     })
-    activeBody = frame(shootingSection, "Options", 0, 22, 292, 320)
+    activeBody = frame(shootingSection, "Options", 0, 22, 292, 157)
     activeBody.BackgroundTransparency = 1
     create("UIListLayout", {
         Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder,
     }, activeBody)
     order = 0
-    toggle("Best shot assist", function() return STR.Enabled end, STR.SetEnabled)
-    keybindRow("Best shot key", "BestShotAssist")
-    toggle("Flick Assist", function() return STR.FlickAssist end, STR.SetFlickAssist)
-    keybindRow("Flick key", "FlickAssist")
-    slider("Flick Smoothness", function() return STR.FlickSmoothness end, STR.SetFlickSmoothness, 1, 10)
+    toggle("Best shot assist", function() return STR.Enabled end, STR.SetEnabled, "BestShot")
     toggle("Auto curve ball", function() return STR.AutoCurve end, STR.SetAutoCurve)
-    keybindRow("Auto curve key", "AutoCurve")
     toggle("Smart shot release", function() return STR.SmartRelease end, STR.SetSmartRelease)
-    keybindRow("Smart release key", "SmartRelease")
-    local miscellaneousSection = frame(strikerContent, "Miscellaneous", 0, 350, 292, 203)
+    do
+        order += 1
+        local row = frame(activeBody, "ShotRange", 0, 0, 292, 49, C.control)
+        row.Size = UDim2.new(1, 0, 0, 49)
+        row.LayoutOrder = order
+        text(row, "Shot range  40–100", 10, {
+            Position = UDim2.fromOffset(12, 0), Size = UDim2.fromOffset(174, 24),
+        })
+        local value = text(row, "", 10, {
+            Name = "Value", Position = UDim2.new(1, -92, 0, 0),
+            Size = UDim2.fromOffset(80, 24), TextXAlignment = Enum.TextXAlignment.Right,
+            TextColor3 = C.accent,
+        })
+        local handle = button(row, {
+            Name = "RangeInput", Position = UDim2.fromOffset(12, 23),
+            Size = UDim2.new(1, -24, 0, 24), BackgroundTransparency = 1, Text = "",
+        })
+        local track = round(frame(handle, "Track", 7, 10, 0, 4, C.accentDim), 2)
+        track.Size = UDim2.new(1, -14, 0, 4)
+        local fill = round(frame(track, "Fill", 0, 0, 0, 4, C.accent), 2)
+        local knob = round(frame(track, "Knob", 0, -5, 14, 14, C.accent), 7)
+        knob.AnchorPoint = Vector2.new(0.5, 0)
+        local previous
+        local function drawRange()
+            local range = STR.GetAssistRange()
+            if range == previous then return end
+            previous = range
+            local alpha = (range - 40) / 60
+            value.Text = tostring(range) .. " studs"
+            fill.Size = UDim2.new(alpha, 0, 1, 0)
+            knob.Position = UDim2.new(alpha, 0, 0, -5)
+        end
+        local function setFromPoint(point)
+            local width = track.AbsoluteSize.X
+            if width <= 0 then return end
+            local alpha = math.clamp((point.X - track.AbsolutePosition.X) / width, 0, 1)
+            STR.SetAssistRange(40 + alpha * 60)
+            drawRange()
+        end
+        connect(handle.InputBegan, function(input)
+            if not S.alive or not Gui.Enabled or minimized or activeTab ~= "STR" or dragging or rangeInput then return end
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                closeDropdown(true)
+                rangeInput = input
+                S.uiBusy = true
+                setFromPoint(input.Position)
+            end
+        end)
+        connect(UserInputService.InputChanged, function(input)
+            if not S.alive or not rangeInput then return end
+            if input == rangeInput or (rangeInput.UserInputType == Enum.UserInputType.MouseButton1
+                and input.UserInputType == Enum.UserInputType.MouseMovement) then setFromPoint(input.Position) end
+        end)
+        connect(UserInputService.InputEnded, function(input)
+            if rangeInput and (input == rangeInput or (rangeInput.UserInputType == Enum.UserInputType.MouseButton1
+                and input.UserInputType == Enum.UserInputType.MouseButton1)) then
+                rangeInput = nil
+                updateUIBusy()
+            end
+        end)
+        drawRange()
+        table.insert(refreshers, drawRange)
+    end
+    local miscellaneousSection = frame(strikerContent, "Miscellaneous", 0, 193, 292, 124)
     miscellaneousSection.BackgroundTransparency = 1
     text(miscellaneousSection, "MISCELLANEOUS", 9, {
         Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(292, 16),
-        Font = Enum.Font.GothamMedium, TextColor3 = C.accentDim,
+        Font = Enum.Font.FredokaOne, TextColor3 = C.muted,
     })
-    activeBody = frame(miscellaneousSection, "Options", 0, 22, 292, 165)
+    activeBody = frame(miscellaneousSection, "Options", 0, 22, 292, 102)
     activeBody.BackgroundTransparency = 1
     create("UIListLayout", {
         Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder,
     }, activeBody)
     order = 0
     toggle("Auto dribble", function() return MISC.AutoDribble end, MISC.SetAutoDribble)
-    keybindRow("Auto dribble key", "AutoDribble")
+    toggle("Auto sprint", function() return MISC.AutoSprint end, MISC.SetAutoSprint)
     toggle("Infinite stamina", function() return MISC.InfiniteStamina end, MISC.SetInfiniteStamina)
-    keybindRow("Infinite stamina key", "InfiniteStamina")
-    order = order + 1
-    local saveButton = button(activeBody, {
-        Name = "SaveConfig", Text = "SAVE CONFIG", TextSize = 10,
-        Size = UDim2.new(1, 0, 0, 28), LayoutOrder = order,
-    })
-    hover(saveButton)
-    connect(saveButton.Activated, function()
-        if not S.alive then return end
-        local ok, detail = saveConfig()
-        saveButton.Text = ok and "SAVED" or "SAVE FAILED"
-        task.delay(0.8, function()
-            if saveButton and saveButton.Parent then saveButton.Text = "SAVE CONFIG" end
-        end)
-    end)
     local strikerStatus = text(strikerContent, "OFF", 11, {
-        Name = "StrikerStatus", Position = UDim2.fromOffset(8, 565),
+        Name = "StrikerStatus", Position = UDim2.fromOffset(8, 327),
         Size = UDim2.fromOffset(276, 30), TextWrapped = true,
-        Font = Enum.Font.GothamMedium, TextColor3 = C.accent,
-    })
-    local strikerDetail = text(strikerContent, "", 10, {
-        Name = "StrikerDetail", Position = UDim2.fromOffset(8, 599),
-        Size = UDim2.fromOffset(276, 54), TextWrapped = true,
-        TextColor3 = C.muted,
+        Font = Enum.Font.FredokaOne, TextColor3 = C.accent,
     })
     local miscellaneousStatus = text(strikerContent, "", 9, {
-        Name = "MiscStatus", Position = UDim2.fromOffset(8, 659), Size = UDim2.fromOffset(276, 28),
-        TextWrapped = true, TextColor3 = C.accentDim,
-    })
-    text(strikerContent, "Shots: within 55 studs. Hold for smart release.\nDribble: nearby opponents within 9 studs.", 10, {
-        Position = UDim2.fromOffset(8, 693), Size = UDim2.fromOffset(276, 32),
+        Name = "MiscStatus", Position = UDim2.fromOffset(8, 361), Size = UDim2.fromOffset(276, 28),
         TextWrapped = true, TextColor3 = C.muted,
     })
+
+    local fit
+    local settingsContent
+    do
+    settingsContent = create("ScrollingFrame", {
+        Name = "SettingsContent", Position = UDim2.fromOffset(12, 76),
+        Size = UDim2.fromOffset(292, 296), BackgroundTransparency = 1,
+        BorderSizePixel = 0, ClipsDescendants = true, Visible = false,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
+        ScrollBarThickness = 2, ScrollBarImageColor3 = C.accentDim,
+        CanvasSize = UDim2.fromOffset(0, 335),
+    }, panel)
+    -- The saved accent stays static; only the displayed palette cycles.
+    local currentAccent = SettingsStore.Accent
+    local rainbowUI = SettingsStore.RainbowUI == true
+    local rainbowHue, rainbowElapsed = 0, 0
+    local refreshColorUI, refreshRainbowToggle
+    local cyclingKeys = { accent = true, accentDim = true, active = true,
+        hover = true, pressed = true, stroke = true }
+    local function rainbowAccent()
+        local color = Color3.fromHSV(rainbowHue, 0.68, 1)
+        return string.format("%02X%02X%02X", math.floor(color.R * 255 + 0.5),
+            math.floor(color.G * 255 + 0.5), math.floor(color.B * 255 + 0.5))
+    end
+    local function repaintPalette(hex, settleColors)
+        setPalette(hex)
+        if settleColors then
+            -- Color-only hover tweens may end at an older hue. Size and arrow
+            -- animations keep running when the rainbow switch changes.
+            for object, goals in pairs(animationGoals) do
+                local bindings, colorOnly = themeBindings[object] or {}, true
+                for property in pairs(goals) do
+                    if not bindings[property] then colorOnly = false; break end
+                end
+                if colorOnly then cancelAnimation(object) end
+            end
+        end
+        for object, properties in pairs(themeBindings) do
+            if object.Parent then
+                local goals = animationGoals[object]
+                for property, key in pairs(properties) do
+                    if cyclingKeys[key] and not (goals and goals[property] ~= nil)
+                        and object[property] ~= C[key] then object[property] = C[key] end
+                end
+            end
+        end
+    end
+    local function setRainbowUI(value)
+        rainbowUI = value == true
+        rainbowElapsed = 0
+        repaintPalette(rainbowUI and not colorPickerOpen and rainbowAccent() or currentAccent, true)
+        if refreshRainbowToggle then refreshRainbowToggle(false) end
+    end
+    local function applyTheme(hex)
+        currentAccent = hex
+        for object, goals in pairs(animationGoals) do
+            for property, value in pairs(goals) do object[property] = value end
+        end
+        S.cancelUITweens()
+        repaintPalette(rainbowUI and not colorPickerOpen and rainbowAccent() or hex, false)
+        if refreshColorUI then refreshColorUI() end
+    end
+    applyTheme(currentAccent)
+    connect(RunService.Heartbeat, function(dt)
+        if not S.alive or not rainbowUI or not Gui.Parent or not Gui.Enabled
+            or minimized or S.focused == false or colorPickerOpen then return end
+        rainbowHue = (rainbowHue + dt / 12) % 1
+        rainbowElapsed += dt
+        if rainbowElapsed < 1 / 30 then return end
+        rainbowElapsed %= 1 / 30
+        repaintPalette(rainbowAccent(), false)
+    end)
+    local settingsController = createDmcSettingsController({
+        config = Config, striker = STR, misc = MISC,
+        gkEnabled = function() return ENV.AUTO_GK_ENABLED == true end,
+        setGK = toggleEnabled, validate = SettingsStore.Validate,
+        accent = function() return currentAccent end, theme = applyTheme,
+        rainbow = function() return rainbowUI end, setRainbow = setRainbowUI,
+        resetGoalkeeper = function() Rush.candidate = nil; invalidateFrame(true); S.nextPlanAt = 0 end,
+    })
+    local configCard = frame(settingsContent, "Configs", 0, 0, 288, 196)
+    configCard.BackgroundTransparency = 1
+    text(configCard, "CONFIGS", 9, {
+        Size = UDim2.fromOffset(288, 16), Font = Enum.Font.FredokaOne, TextColor3 = C.muted,
+    })
+    local function field(parent, name, value, placeholder, x, y, w)
+        local box = round(create("TextBox", {
+            Name = name, Text = value, PlaceholderText = placeholder,
+            Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(w, 32),
+            TextSize = 14, Font = Enum.Font.Nunito, TextColor3 = C.text,
+            PlaceholderColor3 = C.muted, BackgroundColor3 = C.control,
+            BorderSizePixel = 0, ClearTextOnFocus = false, TextEditable = true,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, parent), 5)
+        create("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, box)
+        stroke(box)
+        connect(box.Focused, function()
+            if not S.alive then return end
+            editingField = box
+            updateUIBusy()
+        end)
+        connect(box.FocusLost, function()
+            if editingField == box then editingField = nil end
+            updateUIBusy()
+        end)
+        return box
+    end
+    local configName = field(configCard, "ConfigName", "", "New config name", 0, 22, 288)
+    text(configCard, "SAVED CONFIGS", 9, {
+        Name = "SavedConfigsHeading", Position = UDim2.fromOffset(0, 106), Size = UDim2.fromOffset(288, 16), TextColor3 = C.muted,
+    })
+    local function action(name, x)
+        local control = button(configCard, {
+            Name = name, Text = name, Position = UDim2.fromOffset(x, 64), Size = UDim2.fromOffset(92, 32),
+        })
+        hover(control)
+        return control
+    end
+    local createConfig, saveConfig, loadConfig = action("Create", 0), action("Save", 98), action("Load", 196)
+    local configMessage = text(configCard, SettingsStore.Notice, 10, {
+        Name = "ConfigMessage", Position = UDim2.fromOffset(0, 168), Size = UDim2.fromOffset(288, 28),
+        TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top, TextColor3 = C.muted,
+    })
+    local colorCard = frame(settingsContent, "Appearance", 0, 212, 288, 93)
+    colorCard.BackgroundTransparency = 1
+    text(colorCard, "UI COLOR", 9, {
+        Size = UDim2.fromOffset(288, 16), Font = Enum.Font.FredokaOne, TextColor3 = C.muted,
+    })
+    local rainbowOptions = frame(colorCard, "Options", 0, 22, 288, 32)
+    rainbowOptions.BackgroundTransparency = 1
+    local previousBody, previousOrder = activeBody, order
+    activeBody, order = rainbowOptions, 0
+    refreshRainbowToggle = toggle("Rainbow UI", function() return rainbowUI end, function(value)
+        if settingsBusy then return end
+        local ok, detail = SettingsStore.SetRainbowUI(value)
+        if ok then setRainbowUI(value)
+        else configMessage.Text = detail; setThemed(configMessage, "TextColor3", C.accent) end
+    end)
+    activeBody, order = previousBody, previousOrder
+    local openColor = button(colorCard, {
+        Name = "ChangeColor", Text = "Change UI color", TextXAlignment = Enum.TextXAlignment.Left,
+        Position = UDim2.fromOffset(0, 57), Size = UDim2.fromOffset(288, 36),
+    })
+    create("UIPadding", { PaddingLeft = UDim.new(0, 12) }, openColor)
+    local swatch = round(frame(openColor, "Swatch", 0, 7, 22, 22, C.accent), 4)
+    swatch.Position = UDim2.new(1, -34, 0, 7)
+    hover(openColor)
+    local configExtra, colorExtra = 0, 0
+    local function layoutSettings(immediate, duration, scrollToColor)
+        if fit then fit() end
+        animate(configCard, { Size = UDim2.fromOffset(288, 196 + configExtra) }, immediate, duration)
+        animate(configMessage, { Position = UDim2.fromOffset(0, 168 + configExtra) }, immediate, duration)
+        animate(colorCard, { Position = UDim2.fromOffset(0, 212 + configExtra),
+            Size = UDim2.fromOffset(288, 93 + colorExtra) }, immediate, duration)
+        local canvas = { CanvasSize = UDim2.fromOffset(0, 335 + configExtra + colorExtra) }
+        if scrollToColor then canvas.CanvasPosition = Vector2.new(0, 212 + configExtra)
+        elseif configExtra == 0 and colorExtra == 0 then canvas.CanvasPosition = Vector2.zero end
+        animate(settingsContent, canvas, immediate, duration)
+    end
+    local updateSettingsList
+    local function buildConfigDropdown()
+        local row = frame(configCard, "SavedConfigs", 0, 128, 288, 30)
+        row.BackgroundTransparency, row.ClipsDescendants = 1, true
+        local selectButton = button(row, { Name = "Select", Size = UDim2.fromOffset(288, 30) })
+        stroke(selectButton)
+        local selected = text(selectButton, "No saved configs", 11, {
+            Name = "SelectedValue", Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -48, 1, 0),
+            TextTruncate = Enum.TextTruncate.AtEnd,
+        })
+        local arrow = chevron(selectButton, "Arrow", 0, 8)
+        arrow.Position = UDim2.new(1, -28, 0, 8)
+        local menu = create("ScrollingFrame", {
+            Name = "Choices", Position = UDim2.fromOffset(0, 36), Size = UDim2.fromOffset(288, 0),
+            BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false, ClipsDescendants = true,
+            ScrollingDirection = Enum.ScrollingDirection.Y, ScrollBarThickness = 2,
+            ScrollBarImageColor3 = C.accentDim, CanvasSize = UDim2.fromOffset(0, 0),
+        }, row)
+        create("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, menu)
+        local entry = { row = row, menu = menu, arrow = arrow, open = false }
+        local options, menuHeight, count = {}, 0, 0
+        entry.setOpen = function(open, immediate)
+            entry.open = open and count > 0
+            configExtra = entry.open and menuHeight + 8 or 0
+            if entry.open then menu.Visible = true end
+            for _, option in pairs(options) do
+                option.button.Interactable = entry.open
+                option.marker.Visible = SettingsStore.Selected == option.button.Name
+                if not entry.open then option.reset() end
+            end
+            animate(arrow, { Rotation = entry.open and 180 or 0 }, immediate, 0.18)
+            local duration = entry.open and 0.18 or 0.14
+            animate(row, { Size = UDim2.fromOffset(288, 30 + configExtra) }, immediate, duration, function()
+                if not entry.open then menu.Visible = false end
+            end)
+            layoutSettings(immediate, duration)
+        end
+        table.insert(dropdowns, entry)
+        entry.Refresh = function(names)
+            count = #names
+            selected.Text = count > 0 and SettingsStore.Selected or "No saved configs"
+            selectButton.Interactable = count > 0 and not settingsBusy
+            menuHeight = math.min(156, math.max(0, count * 32 - 4))
+            menu.Size, menu.CanvasSize = UDim2.fromOffset(288, menuHeight), UDim2.fromOffset(0, math.max(0, count * 32 - 4))
+            for index, name in ipairs(names) do
+                local option = options[name]
+                if not option then
+                    local control = button(menu, {
+                        Name = name, Text = "", TextXAlignment = Enum.TextXAlignment.Left,
+                        TextTruncate = Enum.TextTruncate.AtEnd, Size = UDim2.new(1, -4, 0, 28), Interactable = false,
+                    })
+                    local label = text(control, name, 11, {
+                        Name = "Label", Position = UDim2.fromOffset(34, 0), Size = UDim2.new(1, -44, 1, 0),
+                        TextTruncate = Enum.TextTruncate.AtEnd,
+                    })
+                    local marker = chevron(control, "SelectedChevron", 10, 7)
+                    marker.Rotation = -90
+                    local repaint, reset = hover(control, function()
+                        return SettingsStore.Selected == name and C.active or C.control
+                    end)
+                    option = { button = control, text = label, marker = marker, repaint = repaint, reset = reset }
+                    options[name] = option
+                    connect(control.Activated, function()
+                        if not S.alive or settingsBusy or expanded ~= entry or not entry.open then return end
+                        SettingsStore.Select(name)
+                        updateSettingsList()
+                        closeDropdown()
+                    end)
+                end
+                option.button.LayoutOrder, option.button.Interactable = index, entry.open
+                option.marker.Visible = SettingsStore.Selected == name
+                setThemed(option.text, "TextColor3", SettingsStore.Selected == name and C.accent or C.text)
+                option.repaint(true)
+            end
+        end
+        hover(selectButton)
+        connect(selectButton.Activated, function()
+            if not S.alive or settingsBusy or count == 0 then return end
+            local wasOpen = expanded == entry
+            closeDropdown(not wasOpen)
+            if not wasOpen then
+                expanded = entry
+                entry.setOpen(true, false)
+                updateUIBusy()
+            end
+        end)
+        return entry
+    end
+    local configDropdown = buildConfigDropdown()
+    updateSettingsList = function()
+        local names = SettingsStore.List()
+        local selected = table.find(names, SettingsStore.Selected)
+        if not selected and #names > 0 then SettingsStore.Select(names[1]); selected = 1 end
+        configDropdown.Refresh(names)
+        saveConfig.Interactable, loadConfig.Interactable = selected ~= nil and not settingsBusy, selected ~= nil and not settingsBusy
+        createConfig.Interactable = not settingsBusy
+    end
+    local function settingsAction(callback)
+        if not S.alive or settingsBusy then return end
+        closeDropdown(true)
+        settingsBusy = true
+        updateUIBusy()
+        updateSettingsList()
+        local called, ok, detail = pcall(callback)
+        settingsBusy = false
+        updateUIBusy()
+        if not S.alive then return end
+        configMessage.Text = called and tostring(detail) or ("Settings error: " .. tostring(ok))
+        setThemed(configMessage, "TextColor3", called and ok and C.muted or C.accent)
+        updateSettingsList()
+    end
+    connect(createConfig.Activated, function()
+        settingsAction(function()
+            local ok, detail = SettingsStore.Save(configName.Text, settingsController.Snapshot(), true)
+            if ok then configName.Text = "" end
+            return ok, ok and (SettingsStore.Storage:sub(1, 10) == "Local file" and "Created." or "Created for this session.") or detail
+        end)
+    end)
+    connect(saveConfig.Activated, function()
+        settingsAction(function()
+            local ok, detail = SettingsStore.Save(SettingsStore.Selected, settingsController.Snapshot(), false)
+            return ok, ok and (SettingsStore.Storage:sub(1, 10) == "Local file" and "Saved." or "Saved for this session.") or detail
+        end)
+    end)
+    connect(loadConfig.Activated, function()
+        settingsAction(function()
+            local profile = SettingsStore.Get(SettingsStore.Selected)
+            if not profile then return false, "Select a saved config first." end
+            local ok, detail = settingsController.Load(profile)
+            if not ok then return false, detail end
+            SettingsStore.SetAppearance(profile.accent, profile.rainbowUI == true)
+            return true, "Loaded."
+        end)
+    end)
+    -- The spectrum expands inside Settings and previews without writing storage.
+    local function buildColorPicker()
+        local body = round(frame(colorCard, "ColorPicker", 0, 103, 288, 0, C.surface), 5)
+        body.Visible, body.ClipsDescendants = false, true
+        local spectrum = button(body, {
+            Name = "Spectrum", Position = UDim2.fromOffset(12, 12), Size = UDim2.fromOffset(224, 174),
+            BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+        })
+        themeBindings[spectrum].BackgroundColor3 = nil
+        local hueGradient = create("UIGradient", { Rotation = 0 }, spectrum)
+        local saturation = frame(spectrum, "SaturationFade", 0, 0, 224, 174, Color3.fromRGB(255, 255, 255))
+        themeBindings[saturation].BackgroundColor3 = nil
+        create("UIGradient", {
+            Rotation = 90, Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0),
+            }),
+        }, saturation)
+        local cursor = frame(spectrum, "Cursor", 0, 0, 16, 16)
+        cursor.BackgroundTransparency, cursor.AnchorPoint = 1, Vector2.new(0.5, 0.5)
+        local cursorH = frame(cursor, "Horizontal", 0, 7, 16, 2, Color3.fromRGB(0, 0, 0))
+        local cursorV = frame(cursor, "Vertical", 7, 0, 2, 16, Color3.fromRGB(0, 0, 0))
+        themeBindings[cursorH].BackgroundColor3, themeBindings[cursorV].BackgroundColor3 = nil, nil
+        local brightness = button(body, {
+            Name = "Brightness", Position = UDim2.fromOffset(250, 12), Size = UDim2.fromOffset(14, 174),
+            BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+        })
+        themeBindings[brightness].BackgroundColor3 = nil
+        local brightnessGradient = create("UIGradient", { Rotation = 90 }, brightness)
+        local valueMarker = frame(brightness, "Marker", 0, 0, 22, 3, Color3.fromRGB(255, 255, 255))
+        themeBindings[valueMarker].BackgroundColor3 = nil
+        valueMarker.AnchorPoint = Vector2.new(0.5, 0.5)
+        local patch = round(frame(body, "Preview", 12, 198, 62, 86, C.accent), 3)
+        themeBindings[patch].BackgroundColor3 = nil
+        local values: { [string]: TextBox } = {}
+        local h, s, v, updatingHSV = 0, 0, 0, false
+        local colorOriginal, colorDrag, dragSurface = nil, nil, nil
+        local function rgb(hex)
+            return { tonumber(hex:sub(1, 2), 16), tonumber(hex:sub(3, 4), 16), tonumber(hex:sub(5, 6), 16) }
+        end
+        local function readHSV(hex)
+            local channels = rgb(hex)
+            h, s, v = Color3.fromRGB(channels[1], channels[2], channels[3]):ToHSV()
+        end
+        local function draw()
+            local channels = rgb(currentAccent)
+            patch.BackgroundColor3 = Color3.fromRGB(channels[1], channels[2], channels[3])
+            cursor.Position = UDim2.fromScale(1 - h, 1 - s)
+            valueMarker.Position = UDim2.fromScale(0.5, 1 - v)
+            local points = {}
+            for index = 0, 6 do
+                points[#points + 1] = ColorSequenceKeypoint.new(index / 6, Color3.fromHSV(1 - index / 6, 1, v))
+            end
+            hueGradient.Color = ColorSequence.new(points)
+            saturation.BackgroundColor3 = Color3.fromHSV(0, 0, v)
+            brightnessGradient.Color = ColorSequence.new(Color3.fromHSV(h, s, 1), Color3.fromRGB(0, 0, 0))
+            local luminance = channels[1] * 0.299 + channels[2] * 0.587 + channels[3] * 0.114
+            local cursorColor = luminance > 145 and Color3.fromRGB(0, 0, 0) or Color3.fromRGB(255, 255, 255)
+            cursorH.BackgroundColor3, cursorV.BackgroundColor3 = cursorColor, cursorColor
+            local numbers = { Hue = math.floor(h * 360 + 0.5), Saturation = math.floor(s * 100 + 0.5),
+                Value = math.floor(v * 100 + 0.5), Red = channels[1], Green = channels[2], Blue = channels[3] }
+            for key, number in pairs(numbers) do
+                if values[key] then values[key].Text = tostring(number) end
+            end
+            if values.Hex then values.Hex.Text = "#" .. currentAccent end
+        end
+        refreshColorUI = function()
+            if not updatingHSV then readHSV(currentAccent) end
+            draw()
+        end
+        local function setHSV(hue, sat, value)
+            h, s, v = math.clamp(hue, 0, 1), math.clamp(sat, 0, 1), math.clamp(value, 0, 1)
+            local color = Color3.fromHSV(h, s, v)
+            local hex = string.format("%02X%02X%02X", math.floor(color.R * 255 + 0.5),
+                math.floor(color.G * 255 + 0.5), math.floor(color.B * 255 + 0.5))
+            -- Preserve the chosen hue through grey/black and RGB rounding.
+            updatingHSV = true
+            if hex ~= currentAccent then applyTheme(hex) else draw() end
+            updatingHSV = false
+        end
+        for index, key in ipairs({ "Hue", "Saturation", "Value", "Red", "Green", "Blue" }) do
+            local hsv = index <= 3
+            local row = (index - 1) % 3
+            text(body, ({ "Hue", "Sat %", "Val %", "R", "G", "B" })[index], 10, {
+                Position = UDim2.fromOffset(hsv and 82 or 180, 194 + row * 30),
+                Size = UDim2.fromOffset(hsv and 36 or 24, 26), TextColor3 = C.muted,
+            })
+            local input = field(body, key, "", "0", hsv and 120 or 212, 194 + row * 30, hsv and 44 or 64)
+            input.Size = UDim2.fromOffset(hsv and 44 or 64, 26)
+            values[key] = input
+            connect(input.FocusLost, function()
+                if not colorPickerOpen or not S.alive then return end
+                local number = tonumber(input.Text)
+                if not number or number ~= number or math.abs(number) == math.huge then draw(); return end
+                if hsv then
+                    if key == "Hue" then setHSV(math.clamp(number, 0, 360) / 360, s, v)
+                    elseif key == "Saturation" then setHSV(h, math.clamp(number, 0, 100) / 100, v)
+                    else setHSV(h, s, math.clamp(number, 0, 100) / 100) end
+                else
+                    local channels = rgb(currentAccent)
+                    channels[index - 3] = math.clamp(math.floor(number + 0.5), 0, 255)
+                    local hex = string.format("%02X%02X%02X", channels[1], channels[2], channels[3])
+                    if hex ~= currentAccent then applyTheme(hex) else draw() end
+                end
+            end)
+        end
+        text(body, "HTML", 10, {
+            Position = UDim2.fromOffset(12, 294), Size = UDim2.fromOffset(62, 28), TextColor3 = C.muted,
+        })
+        values.Hex = field(body, "Hex", "", "#DEC173", 80, 294, 196)
+        values.Hex.Size, values.Hex.Font = UDim2.fromOffset(196, 28), Enum.Font.Code
+        connect(values.Hex.FocusLost, function()
+            if not colorPickerOpen or not S.alive then return end
+            local hex = SettingsStore.Color(values.Hex.Text)
+            if hex and hex ~= currentAccent then applyTheme(hex) else draw() end
+        end)
+        local function fromColorPoint(point)
+            if dragSurface == spectrum then
+                local size, position = spectrum.AbsoluteSize, spectrum.AbsolutePosition
+                if size.X > 0 and size.Y > 0 then
+                    setHSV(1 - (point.X - position.X) / size.X, 1 - (point.Y - position.Y) / size.Y, v)
+                end
+            elseif dragSurface == brightness then
+                local size, position = brightness.AbsoluteSize, brightness.AbsolutePosition
+                if size.Y > 0 then setHSV(h, s, 1 - (point.Y - position.Y) / size.Y) end
+            end
+        end
+        for _, surface in ipairs({ spectrum, brightness }) do
+            connect(surface.InputBegan, function(input)
+                if not S.alive or not colorPickerOpen or colorDrag then return end
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                    if editingField then editingField:ReleaseFocus() end
+                    colorDrag, dragSurface = input, surface
+                    settingsContent.ScrollingEnabled = false
+                    fromColorPoint(input.Position)
+                end
+            end)
+        end
+        local function expandPicker(open, immediate)
+            colorExtra = open and 384 or 0
+            if open then body.Visible = true end
+            local duration = open and 0.18 or 0.14
+            animate(body, { Size = UDim2.fromOffset(288, open and 374 or 0) }, immediate, duration, function()
+                if not colorPickerOpen then body.Visible = false end
+            end)
+            layoutSettings(immediate, duration, open)
+        end
+        local function dismissColorPicker(keepPreview, immediate)
+            if not colorPickerOpen then return end
+            if editingField then editingField:ReleaseFocus() end
+            colorPickerOpen, colorDrag, dragSurface = false, nil, nil
+            settingsContent.ScrollingEnabled = true
+            if not keepPreview and colorOriginal then applyTheme(colorOriginal) end
+            colorOriginal = nil
+            repaintPalette(rainbowUI and rainbowAccent() or currentAccent, true)
+            expandPicker(false, immediate)
+            updateUIBusy()
+        end
+        closeColorPicker = function() dismissColorPicker(false, true) end
+        connect(openColor.Activated, function()
+            if not S.alive or settingsBusy then return end
+            if colorPickerOpen then dismissColorPicker(false, false); return end
+            closeDropdown(true)
+            colorOriginal, colorPickerOpen = currentAccent, true
+            repaintPalette(currentAccent, true)
+            refreshColorUI()
+            expandPicker(true, false)
+            updateUIBusy()
+        end)
+        local cancelColor = button(body, {
+            Name = "Cancel", Text = "Cancel", Position = UDim2.fromOffset(12, 334), Size = UDim2.fromOffset(126, 30),
+        })
+        local applyColor = button(body, {
+            Name = "Apply", Text = "Apply", Position = UDim2.fromOffset(150, 334), Size = UDim2.fromOffset(126, 30),
+        })
+        hover(cancelColor); hover(applyColor)
+        connect(cancelColor.Activated, function() dismissColorPicker(false, false) end)
+        connect(applyColor.Activated, function()
+            if not S.alive or not colorPickerOpen then return end
+            dismissColorPicker(true, false)
+            settingsAction(function()
+                local ok, detail = SettingsStore.SetAccent(currentAccent)
+                return ok, ok and (SettingsStore.Storage:sub(1, 10) == "Local file" and "Color applied." or "Color applied for this session.") or detail
+            end)
+        end)
+        connect(UserInputService.InputChanged, function(input)
+            if not S.alive or not colorPickerOpen or not colorDrag then return end
+            if input == colorDrag or (colorDrag.UserInputType == Enum.UserInputType.MouseButton1
+                and input.UserInputType == Enum.UserInputType.MouseMovement) then fromColorPoint(input.Position) end
+        end)
+        connect(UserInputService.InputEnded, function(input)
+            if colorDrag and (input == colorDrag or (colorDrag.UserInputType == Enum.UserInputType.MouseButton1
+                and input.UserInputType == Enum.UserInputType.MouseButton1)) then
+                colorDrag, dragSurface = nil, nil
+                settingsContent.ScrollingEnabled = true
+            end
+        end)
+        refreshColorUI()
+    end
+    buildColorPicker()
+
+    updateSettingsList()
+
+
+    end
 
     local dragInput, dragStart, hostStart
     local lastViewport = nil
     local lastMinimized = nil
     local lastTab = nil
+    local lastHeight = nil
     local refresh
     local function viewportSize()
         local camera = workspace.CurrentCamera
         return camera and camera.ViewportSize or Vector2.new(1280, 720)
     end
 
-    local function fit(requestedX, requestedY)
+    fit = function(requestedX, requestedY)
         local viewport = viewportSize()
         local top = math.min(48, viewport.Y * 0.1)
-        local width, height = 316, minimized and 40 or 494
+        local width, height = 316, minimized and 40 or (activeTab == "GK" and 494 or (activeTab == "STR" and 491 or (colorPickerOpen and 581 or 419)))
         local scale = math.min(1, math.max(1, viewport.X - 32) / width,
             math.max(1, viewport.Y - top - 16) / height)
-        if viewport ~= lastViewport or minimized ~= lastMinimized or activeTab ~= lastTab then
+        if viewport ~= lastViewport or minimized ~= lastMinimized or activeTab ~= lastTab or height ~= lastHeight then
             uiScale.Scale = scale
             panel.Size = UDim2.fromOffset(width, height)
             tabBar.Visible = not minimized
             content.Visible = not minimized and activeTab == "GK"
             live.Visible = not minimized and activeTab == "GK"
             strikerContent.Visible = not minimized and activeTab == "STR"
-            lastViewport, lastMinimized, lastTab = viewport, minimized, activeTab
+            settingsContent.Visible = not minimized and activeTab == "Settings"
+            lastViewport, lastMinimized, lastTab, lastHeight = viewport, minimized, activeTab, height
+            settingsContent.Size = UDim2.fromOffset(292, height - 88)
         end
         local x = math.clamp(requestedX or host.Position.X.Offset, 16,
             math.max(16, viewport.X - width * scale - 16))
@@ -9072,7 +10260,7 @@ do
             and input.UserInputType == Enum.UserInputType.MouseButton1) then
             dragging = false
             dragInput = nil
-            S.uiBusy = expanded ~= nil
+            updateUIBusy()
         end
     end)
     connect(UserInputService.InputChanged, function(input)
@@ -9107,16 +10295,16 @@ do
     end)
 
     local function writeChanged(object, property, value)
-        if object[property] ~= value then object[property] = value end
+        if object[property] ~= value then setThemed(object, property, value) end
     end
     refresh = function()
         if not Gui.Enabled or not Gui.Parent then return end
         if viewportSize() ~= lastViewport then fit() end
         if minimized then return end
+        if activeTab == "Settings" then return end
         if activeTab == "STR" then
             for i = gkRefresherCount + 1, #refreshers do refreshers[i]() end
             writeChanged(strikerStatus, "Text", STR.Status)
-            writeChanged(strikerDetail, "Text", STR.Detail)
             writeChanged(miscellaneousStatus, "Text", "Dribble: " .. MISC.DribbleStatus .. " | Stamina: " .. MISC.StaminaStatus)
             return
         end
@@ -9128,14 +10316,14 @@ do
     end
 
     local tabRefreshers = {}
-    local function addTab(name, x)
+    local function addTab(name, labelText, x, width)
         local control = button(tabBar, {
             Name = name, Position = UDim2.fromOffset(x, 0),
-            Size = UDim2.fromOffset(142, 26),
+            Size = UDim2.fromOffset(width, 26),
         })
-        local label = text(control, name, 11, {
+        local label = text(control, labelText, 11, {
             Name = "Label", Size = UDim2.fromScale(1, 1),
-            Font = Enum.Font.GothamMedium,
+            Font = Enum.Font.FredokaOne,
             TextXAlignment = Enum.TextXAlignment.Center,
         })
         local border = stroke(control)
@@ -9159,8 +10347,9 @@ do
         end)
         draw(true)
     end
-    addTab("GK", 0)
-    addTab("STR", 150)
+    addTab("GK", "Goalkeeper", 0, 108)
+    addTab("STR", "Striker", 114, 82)
+    addTab("Settings", "Settings", 202, 90)
 
     connect(RunService.Heartbeat, function()
         if not S.alive or not Gui.Enabled or not Gui.Parent then return end
@@ -9236,6 +10425,11 @@ ENV.AutoGKDebug = function()
         "| delayed candidates:", S.delayedPlansChecked,
         "| milliseconds:", S.plannerMilliseconds
     )
+    print("[Auto GK] contact timing waits:", S.keeperWaits or 0,
+        "| deadline:", S.keeperWait and math.max(0, S.keeperWait.deadline - os.clock()) or 0,
+        "| intervening contact:", S.keeperContact and S.keeperContact.time or "none",
+        "| timing errors:", S.keeperTimingErrors or 0,
+        "| last timing error:", S.keeperTimingError or "none")
 
     print(
         "[Auto GK] close-range rush:", Config.CloseRangeRush,
@@ -9362,14 +10556,10 @@ ENV.AutoGKDebug = function()
             )
         end
     end
-
-    -- Start hidden; RightShift still toggles the UI open/closed.
-    if SafeConfig.UIStartHidden then
-        Gui.Enabled = false
-    end
 end
 
-print("[Auto GK] Loaded | RightShift: show / hide | UI starts hidden")
+SettingsStore.Acknowledge()
+print("[Banyu] Loaded | " .. RELEASE_VERSION .. " | RightShift: show / hide")
 
 -- BANYU MAIN END
 end)
