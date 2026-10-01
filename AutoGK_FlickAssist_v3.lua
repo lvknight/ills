@@ -8818,7 +8818,7 @@ ENV.DmcMarkTrial = function(kind, outcomes, trialId)
 end
 ENV.DmcMarkOutcome = function(kind, outcome, id)
     local ok, detail = EVALUATION.Mark(kind, outcome, id)
-    print("[Banyu Evaluation]", ok and "Outcome recorded" or "Not recorded", detail)
+    print("[Dmc Evaluation]", ok and "Outcome recorded" or "Not recorded", detail)
     return ok, detail
 end
 local STR = createStriker({
@@ -8878,7 +8878,7 @@ end)
 ENV.DmcMisc = MISC
 ENV.DmcMiscDebug = function()
     local result = MISC.Debug()
-    print("[Banyu Misc]", game:GetService("HttpService"):JSONEncode(result))
+    print("[Dmc Misc]", game:GetService("HttpService"):JSONEncode(result))
     return result
 end
 
@@ -10561,5 +10561,5 @@ end
 SettingsStore.Acknowledge()
 print("[Banyu] Loaded | " .. RELEASE_VERSION .. " | RightShift: show / hide")
 
--- BANYU MAIN END
+-- DMC MAIN END
 end)
