@@ -1,123 +1,122 @@
-local function createAutoSprint(d)
-    local A = { AutoSprint = false, Status = "OFF", LastError = nil }
-    local native, heartbeat, removing, focus, removingCharacter = nil, nil, nil, nil, nil
-    local ownsToggle, loading, alive, revision, nextTick = false, false, true, 0, 0
-    local function publish()
-        if d.changed then d.changed(A) end
+local function createDmcStartup(d)
+    local B = {
+        stage = "Waiting for the game", finished = false,
+        cleanup = nil :: (() -> (boolean?, string?))?,
+        error = nil :: string?,
+    }
+    function B.Status(text)
+        B.stage = text
+        if not B.finished then pcall(d.show, "Banyu | Starting", text) end
     end
-    local function disconnect()
-        if heartbeat then heartbeat:Disconnect(); heartbeat = nil end
-        if removing then removing:Disconnect(); removing = nil end
-        if focus then focus:Disconnect(); focus = nil end
-    end
-    local function release()
-        if not ownsToggle then return true end
-        local ok, err = pcall(function()
-            if native.IsSprintButtonToggled() then native.ToggleSprintButton() end
-            assert(not native.IsSprintButtonToggled(), "Sprint toggle was not released")
+    function B.Load(path)
+        B.Status("Loading " .. path)
+        local object = d.resolve(path)
+        local result, closed
+        d.spawn(function()
+            local values = table.pack(pcall(d.require, object))
+            if not closed then result = values end
         end)
-        if ok then ownsToggle = false else A.LastError = tostring(err) end
-        return ok
+        local deadline = d.now() + 30
+        while not result and d.now() < deadline do d.wait() end
+        closed = true
+        assert(result, "Timed out loading " .. path .. ". The game module did not return within 30 seconds.")
+        assert(result[1], "Cannot load " .. path .. ": " .. tostring(result[2]))
+        assert(type(result[2]) == "table", "Unexpected module result: " .. path)
+        return result[2]
     end
-    local function fail(err)
-        A.LastError, A.AutoSprint = tostring(err), false
-        revision += 1
-        disconnect()
-        A.Status = release() and "ERROR" or "CLEANUP REQUIRED"
-        publish()
-        warn("[Dmc Auto sprint] " .. A.LastError)
-        return false
-    end
-    local function allowed()
-        if not (alive and A.AutoSprint and d.alive()) then return false end
-        if d.suspended() or d.Gui.MenuIsOpen or d.Input:GetFocusedTextBox() then return false end
-        local character = d.Player.Character
-        local humanoid = character and character.Parent and character ~= removingCharacter
-            and character:FindFirstChildOfClass("Humanoid") or nil
-        return humanoid ~= nil and humanoid.Parent == character and humanoid.Health > 0
-    end
-    local function sync()
-        if not allowed() then
-            assert(release(), A.LastError or "Could not release auto sprint")
-            A.Status = "PAUSED"
-        elseif native.IsSprintButtonToggled() then
-            A.Status = "ON"
-        elseif native.IsSprintButtonUsable() then
-            -- Keyboard Shift and joystick intent use separate native held flags.
-            -- Removing this toggle does not release either of those manual inputs.
-            ownsToggle = true
-            native.ToggleSprintButton()
-            assert(native.IsSprintButtonToggled(), "Sprint toggle was not accepted")
-            A.Status = "ON"
+    function B.Run(main)
+        B.Status(B.stage)
+        local ok, err = pcall(function() d.ready(); main(B) end)
+        B.finished = true
+        if ok then
+            pcall(d.hide)
         else
-            -- Native exhaustion clears the button. Wait until the game permits a restart.
-            ownsToggle = false
-            A.Status = "WAITING"
+            local message = tostring(err)
+            local cleanup = B.cleanup
+            if cleanup then
+                local cleaned, released = pcall(cleanup)
+                if not cleaned or released == false then message = message .. "\nCleanup incomplete; rejoin before retrying." end
+            end
+            B.error = message
+            d.warn("[Banyu startup] " .. message)
+            pcall(d.show, "Banyu | Startup failed", message .. "\n\nSend this error and your executor name when reporting the problem.")
         end
-        publish()
+        return ok, err
     end
-    function A.SetAutoSprint(value)
-        value = value == true
-        if value and A.AutoSprint then return not loading end
-        revision += 1
-        local request = revision
-        if not value then
-            A.AutoSprint = false
-            disconnect()
-            local ok = release()
-            A.Status = ok and "OFF" or "CLEANUP REQUIRED"
-            publish()
-            return ok
-        end
-        if not alive or not d.alive() then return false end
-        A.AutoSprint, A.Status, loading = true, "STARTING", true
-        publish()
-        local ok, err = pcall(function()
-            native = native or d.load("Client.Gameplay.Player.Sprint")
-            for _, name in ipairs({ "ToggleSprintButton", "IsSprintButtonToggled", "IsSprintButtonUsable" }) do
-                assert(type(native[name]) == "function", "Native sprint API unavailable: " .. name)
-            end
-        end)
-        loading = false
-        if request ~= revision or not (alive and A.AutoSprint and d.alive()) then return false end
-        if not ok then return fail(err) end
-        ok, err = pcall(sync)
-        if not ok then return fail(err) end
-        nextTick = 0
-        heartbeat = d.Run.Heartbeat:Connect(function()
-            if not A.AutoSprint then return end
-            local now = os.clock()
-            if now < nextTick then return end
-            nextTick = now + 0.1
-            local worked, detail = pcall(sync)
-            if not worked then fail(detail) end
-        end)
-        removing = d.Player.CharacterRemoving:Connect(function(character)
-            removingCharacter = character
-            if A.AutoSprint then
-                if not release() then fail(A.LastError) else A.Status = "PAUSED"; publish() end
-            end
-        end)
-        focus = d.Input.WindowFocusReleased:Connect(function()
-            if A.AutoSprint then
-                if not release() then fail(A.LastError) else A.Status = "PAUSED"; publish() end
-            end
-        end)
-        return true
-    end
-    function A.Cleanup()
-        alive = false
-        return A.SetAutoSprint(false)
-    end
-    function A.Debug()
-        return { enabled = A.AutoSprint, status = A.Status, ownsToggle = ownsToggle,
-            lastError = A.LastError, version = "Auto sprint 1.0" }
-    end
-    return A
+    return B
 end
 
+local function createDmcStartupDisplay()
+    local gui, label, heading, closeConnection
+    local function hide()
+        if closeConnection then closeConnection:Disconnect(); closeConnection = nil end
+        if gui then gui:Destroy(); gui = nil end
+    end
+    local function show(title, message)
+        if not gui then
+            local player = game:GetService("Players").LocalPlayer
+            local parent = player and player:FindFirstChildOfClass("PlayerGui")
+            if not parent then return end
+            gui = Instance.new("ScreenGui")
+            gui.Name, gui.ResetOnSpawn, gui.DisplayOrder = "DmcStartup", false, 1000
+            local panel = Instance.new("Frame")
+            panel.AnchorPoint = Vector2.new(0.5, 0.5)
+            panel.Position, panel.Size = UDim2.new(0.5, 0, 0.4, 0), UDim2.new(0.9, 0, 0, 200)
+            panel.BackgroundColor3, panel.BorderSizePixel = Color3.fromRGB(16, 16, 15), 0
+            panel.Parent = gui
+            local size = Instance.new("UISizeConstraint")
+            size.MaxSize = Vector2.new(460, 200); size.Parent = panel
+            heading = Instance.new("TextLabel")
+            heading.Position, heading.Size = UDim2.new(0, 14, 0, 8), UDim2.new(1, -58, 0, 28)
+            heading.BackgroundTransparency, heading.TextSize = 1, 16
+            heading.TextXAlignment, heading.Font = Enum.TextXAlignment.Left, Enum.Font.GothamMedium
+            heading.TextColor3 = Color3.fromRGB(222, 193, 115); heading.Parent = panel
+            label = Instance.new("TextBox")
+            label.Position, label.Size = UDim2.new(0, 14, 0, 44), UDim2.new(1, -28, 1, -54)
+            label.BackgroundTransparency, label.TextSize, label.TextWrapped = 1, 13, true
+            label.ClearTextOnFocus, label.TextEditable, label.MultiLine = false, false, true
+            label.TextXAlignment, label.TextYAlignment = Enum.TextXAlignment.Left, Enum.TextYAlignment.Top
+            label.Font, label.TextColor3 = Enum.Font.Code, Color3.fromRGB(233, 231, 220)
+            label.Parent = panel
+            local close = Instance.new("TextButton")
+            close.Text, close.TextSize = "X", 14
+            close.Position, close.Size = UDim2.new(1, -38, 0, 8), UDim2.new(0, 28, 0, 28)
+            close.BackgroundColor3, close.TextColor3 = Color3.fromRGB(39, 37, 30), heading.TextColor3
+            close.Parent = panel
+            closeConnection = close.Activated:Connect(hide)
+            gui.Parent = parent
+        end
+        heading.Text, label.Text = title, message
+    end
+    return show, hide
+end
 
--- Local settings storage. The fixed filename never depends on a config name.
+local startupShow, startupHide = createDmcStartupDisplay()
+local BOOT = createDmcStartup({
+    now = os.clock, wait = function() task.wait(0.05) end, spawn = task.spawn,
+    require = require, warn = warn, show = startupShow, hide = startupHide,
+    ready = function()
+        local players = game:GetService("Players")
+        local deadline = os.clock() + 30
+        while (not game:IsLoaded() or not players.LocalPlayer) and os.clock() < deadline do
+            startupShow("Banyu | Starting", "Waiting for the game to finish loading...")
+            task.wait(0.1)
+        end
+        assert(game:IsLoaded() and players.LocalPlayer, "Game client was not ready after 30 seconds. Join the game before running Banyu.")
+        assert(players.LocalPlayer:WaitForChild("PlayerGui", 30), "PlayerGui is unavailable.")
+        startupShow("Banyu | Starting", "Loading game modules...")
+    end,
+    resolve = function(path)
+        local object = game:GetService("ReplicatedStorage")
+        local deadline = os.clock() + 30
+        for name in string.gmatch(path, "[^.]+") do
+            object = object:WaitForChild(name, math.max(0.01, deadline - os.clock()))
+            assert(object, "Missing dependency: " .. path .. ". Run Banyu in the supported game after it loads.")
+        end
+        return object
+    end,
+})
+
 local function createDmcConfigStore(d)
     local A = { Accent = "DEC173", RainbowUI = false, Selected = "", Storage = "Session only", Notice = "" }
     local document = { schema = 1, profiles = {}, accent = A.Accent, rainbowUI = false, selected = "" }
@@ -165,8 +164,6 @@ local function createDmcConfigStore(d)
             if type(value.misc[key]) ~= "boolean" then return nil end
             misc[key] = value.misc[key]
         end
-        if value.misc.AutoSprint ~= nil and type(value.misc.AutoSprint) ~= "boolean" then return nil end
-        misc.AutoSprint = value.misc.AutoSprint == true
         local accent = A.Color(value.accent)
         if not accent then return nil end
         if value.rainbowUI ~= nil and type(value.rainbowUI) ~= "boolean" then return nil end
@@ -284,6 +281,7 @@ end
 
 -- Configs use the same feature setters as the controls. A refused native setter
 -- rolls settings back instead of displaying a successful load.
+
 local function createDmcSettingsController(d)
     local A = {}
     function A.Snapshot()
@@ -295,8 +293,7 @@ local function createDmcSettingsController(d)
         return { goalkeeper = gk,
             striker = { Enabled = d.striker.Enabled, AutoCurve = d.striker.AutoCurve,
                 SmartRelease = d.striker.SmartRelease, Range = d.striker.GetAssistRange() },
-            misc = { AutoDribble = d.misc.AutoDribble, AutoSprint = d.misc.AutoSprint == true,
-                InfiniteStamina = d.misc.InfiniteStamina },
+            misc = { AutoDribble = d.misc.AutoDribble, InfiniteStamina = d.misc.InfiniteStamina },
             accent = d.accent(), rainbowUI = d.rainbow and d.rainbow() == true or false }
     end
     local function apply(profile)
@@ -310,7 +307,6 @@ local function createDmcSettingsController(d)
         feature(d.striker, "Enabled", profile.striker.Enabled)
         assert(d.striker.SetAssistRange(profile.striker.Range) ~= false, "Shot range could not be changed")
         feature(d.misc, "AutoDribble", profile.misc.AutoDribble)
-        feature(d.misc, "AutoSprint", profile.misc.AutoSprint)
         feature(d.misc, "InfiniteStamina", profile.misc.InfiniteStamina)
         for key, value in pairs(profile.goalkeeper) do if key ~= "Enabled" then d.config[key] = value end end
         d.resetGoalkeeper()
@@ -331,6 +327,7 @@ local function createDmcSettingsController(d)
     return A
 end
 
+
 local function showDmcUpdatePrompt(parent, hex)
     local gui = Instance.new("ScreenGui")
     gui.Name, gui.ResetOnSpawn, gui.DisplayOrder = "DmcUpdate", false, 1001
@@ -348,7 +345,7 @@ local function showDmcUpdatePrompt(parent, hex)
     local heading = Instance.new("TextLabel")
     heading.Position, heading.Size = UDim2.fromOffset(14, 8), UDim2.new(1, -28, 0, 28)
     heading.BackgroundTransparency, heading.TextSize, heading.Font = 1, 18, Enum.Font.FredokaOne
-    heading.TextXAlignment, heading.TextColor3, heading.Text, heading.Parent = Enum.TextXAlignment.Left, accent, "Dmc | Script updated", panel
+    heading.TextXAlignment, heading.TextColor3, heading.Text, heading.Parent = Enum.TextXAlignment.Left, accent, "Banyu | Script updated", panel
     local message = Instance.new("TextLabel")
     message.Position, message.Size = UDim2.fromOffset(14, 52), UDim2.new(1, -28, 0, 56)
     message.BackgroundTransparency, message.TextWrapped, message.TextSize = 1, true, 16
@@ -372,129 +369,10 @@ local function showDmcUpdatePrompt(parent, hex)
 end
 
 
--- Small, dependency-free startup controller. Game modules are loaded only after
--- its status panel is visible. No executor-specific GUI or identity API is needed.
-local function createDmcStartup(d)
-    local B = {
-        stage = "Waiting for the game", finished = false,
-        cleanup = nil :: (() -> (boolean?, string?))?,
-        error = nil :: string?,
-    }
-    function B.Status(text)
-        B.stage = text
-        if not B.finished then pcall(d.show, "Dmc | Starting", text) end
-    end
-    function B.Load(path)
-        B.Status("Loading " .. path)
-        local object = d.resolve(path)
-        local result, closed
-        d.spawn(function()
-            local values = table.pack(pcall(d.require, object))
-            if not closed then result = values end
-        end)
-        local deadline = d.now() + 30
-        while not result and d.now() < deadline do d.wait() end
-        closed = true
-        assert(result, "Timed out loading " .. path .. ". The game module did not return within 30 seconds.")
-        assert(result[1], "Cannot load " .. path .. ": " .. tostring(result[2]))
-        assert(type(result[2]) == "table", "Unexpected module result: " .. path)
-        return result[2]
-    end
-    function B.Run(main)
-        B.Status(B.stage)
-        local ok, err = pcall(function() d.ready(); main(B) end)
-        B.finished = true
-        if ok then
-            pcall(d.hide)
-        else
-            local message = tostring(err)
-            local cleanup = B.cleanup
-            if cleanup then
-                local cleaned, released = pcall(cleanup)
-                if not cleaned or released == false then message = message .. "\nCleanup incomplete; rejoin before retrying." end
-            end
-            B.error = message
-            d.warn("[Dmc startup] " .. message)
-            pcall(d.show, "Dmc | Startup failed", message .. "\n\nSend this error and your executor name when reporting the problem.")
-        end
-        return ok, err
-    end
-    return B
-end
 
-local function createDmcStartupDisplay()
-    local gui, label, heading, closeConnection
-    local function hide()
-        if closeConnection then closeConnection:Disconnect(); closeConnection = nil end
-        if gui then gui:Destroy(); gui = nil end
-    end
-    local function show(title, message)
-        if not gui then
-            local player = game:GetService("Players").LocalPlayer
-            local parent = player and player:FindFirstChildOfClass("PlayerGui")
-            if not parent then return end
-            gui = Instance.new("ScreenGui")
-            gui.Name, gui.ResetOnSpawn, gui.DisplayOrder = "DmcStartup", false, 1000
-            local panel = Instance.new("Frame")
-            panel.AnchorPoint = Vector2.new(0.5, 0.5)
-            panel.Position, panel.Size = UDim2.new(0.5, 0, 0.4, 0), UDim2.new(0.9, 0, 0, 200)
-            panel.BackgroundColor3, panel.BorderSizePixel = Color3.fromRGB(16, 16, 15), 0
-            panel.Parent = gui
-            local size = Instance.new("UISizeConstraint")
-            size.MaxSize = Vector2.new(460, 200); size.Parent = panel
-            heading = Instance.new("TextLabel")
-            heading.Position, heading.Size = UDim2.new(0, 14, 0, 8), UDim2.new(1, -58, 0, 28)
-            heading.BackgroundTransparency, heading.TextSize = 1, 16
-            heading.TextXAlignment, heading.Font = Enum.TextXAlignment.Left, Enum.Font.GothamMedium
-            heading.TextColor3 = Color3.fromRGB(222, 193, 115); heading.Parent = panel
-            label = Instance.new("TextBox")
-            label.Position, label.Size = UDim2.new(0, 14, 0, 44), UDim2.new(1, -28, 1, -54)
-            label.BackgroundTransparency, label.TextSize, label.TextWrapped = 1, 13, true
-            label.ClearTextOnFocus, label.TextEditable, label.MultiLine = false, false, true
-            label.TextXAlignment, label.TextYAlignment = Enum.TextXAlignment.Left, Enum.TextYAlignment.Top
-            label.Font, label.TextColor3 = Enum.Font.Code, Color3.fromRGB(233, 231, 220)
-            label.Parent = panel
-            local close = Instance.new("TextButton")
-            close.Text, close.TextSize = "X", 14
-            close.Position, close.Size = UDim2.new(1, -38, 0, 8), UDim2.new(0, 28, 0, 28)
-            close.BackgroundColor3, close.TextColor3 = Color3.fromRGB(39, 37, 30), heading.TextColor3
-            close.Parent = panel
-            closeConnection = close.Activated:Connect(hide)
-            gui.Parent = parent
-        end
-        heading.Text, label.Text = title, message
-    end
-    return show, hide
-end
-
-local startupShow, startupHide = createDmcStartupDisplay()
-local BOOT = createDmcStartup({
-    now = os.clock, wait = function() task.wait(0.05) end, spawn = task.spawn,
-    require = require, warn = warn, show = startupShow, hide = startupHide,
-    ready = function()
-        local players = game:GetService("Players")
-        local deadline = os.clock() + 30
-        while (not game:IsLoaded() or not players.LocalPlayer) and os.clock() < deadline do
-            startupShow("Dmc | Starting", "Waiting for the game to finish loading...")
-            task.wait(0.1)
-        end
-        assert(game:IsLoaded() and players.LocalPlayer, "Game client was not ready after 30 seconds. Join the game before running Dmc.")
-        assert(players.LocalPlayer:WaitForChild("PlayerGui", 30), "PlayerGui is unavailable.")
-        startupShow("Dmc | Starting", "Loading game modules...")
-    end,
-    resolve = function(path)
-        local object = game:GetService("ReplicatedStorage")
-        local deadline = os.clock() + 30
-        for name in string.gmatch(path, "[^.]+") do
-            object = object:WaitForChild(name, math.max(0.01, deadline - os.clock()))
-            assert(object, "Missing dependency: " .. path .. ". Run Dmc in the supported game after it loads.")
-        end
-        return object
-    end,
-})
 
 BOOT.Run(function()
--- DMC MAIN BEGIN
+-- BANYU MAIN BEGIN
 --==============================================================
 -- SERVICES
 --==============================================================
@@ -506,9 +384,8 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
--- Bump the release ID for every shipped update to trigger the one-time OK prompt.
-local RELEASE_VERSION = "2026.10.02.01"
-local BUILD = "Dmc Settings 1.5.1 | GK 3.2.8 | STR 0.16.4 | Misc 0.17.6 | Auto sprint 1.0 | Evaluation 0.2"
+local RELEASE_VERSION = "2026.10.02.02"
+local BUILD = "Banyu | GK v18 | STR v18 | Misc new | Settings new"
 local ENV = _G
 if type(getgenv) == "function" then
     local ok, environment = pcall(getgenv)
@@ -597,6 +474,13 @@ end
 -- CONFIGURATION
 --==============================================================
 
+local SafeConfig = {
+    -- Conservative goalkeeper defaults: only lateral dives and no backward recovery.
+    DiveFilter = "SIDES",
+    BackwardRecovery = false,
+    UIStartHidden = true,
+}
+
 local Config = {
     Enabled = true,
     PositionAssist = true,
@@ -613,8 +497,8 @@ local Config = {
     RespectManualMovement = true,
     HighBallJumps = true,
     JumpThenDive = true,
-    DiveFilter = "SMART",
-    BackwardRecovery = true,
+    DiveFilter = SafeConfig.DiveFilter,
+    BackwardRecovery = SafeConfig.BackwardRecovery,
     PlannerHz = 12,
     CloseShotPlannerHz = 30,
     UISampleHz = 4,
@@ -645,6 +529,26 @@ local Config = {
     Debug = false,
 }
 
+-- User-configurable feature keybinds. These toggle the corresponding feature;
+-- they do not replace the game's movement/dive keys.
+local FeatureKeybinds = {
+    -- Empty by default. The player must assign each key manually from the UI.
+    AutoSave = "",
+    CloseRangeRush = "",
+    HighBallJumps = "",
+    JumpThenDive = "",
+    BackwardRecovery = "",
+    PositionAssist = "",
+    PreShotCoverage = "",
+    ManualMovementFirst = "",
+    BestShotAssist = "",
+    FlickAssist = "",
+    AutoCurve = "",
+    SmartRelease = "",
+    AutoDribble = "",
+    InfiniteStamina = "",
+}
+
 local Stats = {
     Requests = 0,
     JumpRequests = 0,
@@ -656,6 +560,7 @@ local Stats = {
 }
 
 ENV.AutoGKConfig = Config
+ENV.AutoGKSafeConfig = SafeConfig
 ENV.AutoGKStats = Stats
 ENV.AUTO_GK_ENABLED = true
 ENV.AutoGKBuild = BUILD
@@ -795,7 +700,6 @@ local function cleanup()
         S.ui = nil
         S.closeDropdown = nil
         S.cancelUITweens = nil
-        S.isUIInput = nil
     end
 
     if S.loopBusy then
@@ -1063,8 +967,6 @@ end
 
 local function invalidateFrame(allowWrite)
     S.lastFrame = nil
-    S.keeperWait = nil
-    S.keeperContact = nil
     S.allowPositioning = false
     S.coverageFrame = nil
     S.coverageNextAt = 0
@@ -1709,7 +1611,6 @@ local function snapshot(character, root, humanoid)
         at = timestamp,
         readClock = readClock,
         sourceTrajectory = sourceTrajectory,
-        lastKickerUserId = state.LastKickerUserId,
         launchAt = nil,
         context = context,
         ballId = ball.ballId,
@@ -2156,28 +2057,6 @@ local function inspectPath(f, plan, points, requireContact)
     }
 end
 
-local function threatSide(f)
-    if not f or not f.context or not f.goalPosition then return 0 end
-    local origin = f.context.goal.Position
-    local half = math.max(0.5, goalHalfWidth(f.context))
-    local x = (f.goalPosition - origin):Dot(f.context.right)
-    if math.abs(x) > half * 0.18 then
-        return x > 0 and 1 or -1
-    end
-
-    local ballX = (f.state.Position - origin):Dot(f.context.right)
-    if math.abs(ballX) > half * 0.12 then
-        return ballX > 0 and 1 or -1
-    end
-
-    local lateralVelocity = f.velocity:Dot(f.context.right)
-    if math.abs(lateralVelocity) > 1.5 then
-        return lateralVelocity > 0 and 1 or -1
-    end
-
-    return 0
-end
-
 local function allowedDirections(f)
     local filter = Config.DiveFilter
     local result
@@ -2189,16 +2068,7 @@ local function allowedDirections(f)
     elseif filter == "RIGHT" then
         result = { "R", "RF" }
     elseif filter == "SIDES" then
-        -- SIDES is directional, not a blind L/R search. Once the predicted
-        -- crossing is clearly on one side, only that side is considered.
-        local side = threatSide(f)
-        if side < 0 then
-            result = { "L", "LF" }
-        elseif side > 0 then
-            result = { "R", "RF" }
-        else
-            result = { "L", "R", "LF", "RF" }
-        end
+        result = { "L", "R" }
     else
         result = { "F", "L", "R", "LF", "RF" }
     end
@@ -2428,207 +2298,6 @@ local function divePathMayReach(f, points, horizon)
         or minZ > math.max(start.Z, finish.Z) + reach)
 end
 
--- Receiver/blocker forecasts only postpone an already verified dive. They
--- never suppress a goal-bound ball or authorize a contact on a guessed bounce.
-local KeeperTiming = {
-    ForecastSeconds = 0.35,
-    LaunchReserveSeconds = 0.10,
-    ContactOrderMarginSeconds = 0.035,
-    MinimumWaitSeconds = 0.015,
-    UrgentGoalSeconds = 0.25,
-    Delays = { 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50 },
-}
-
-function KeeperTiming.RootAt(body, t)
-    local dy = body.airborne and math.max(body.floor - body.cf.Position.Y,
-        body.velocity.Y * t - 0.5 * body.gravity * t * t) or 0
-    return body.cf + body.horizontal * t + Vector3.new(0, dy, 0)
-end
-
-function KeeperTiming.PlayerContact(f, character, actor, points, limit)
-    if character == f.character or not character.Parent
-        or M.Motion.GetContext(character) ~= M.Motion.GetContext(f.character) then return nil end
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    local root = type(M.Motion.GetQueryRoot) == "function" and M.Motion.GetQueryRoot(character)
-        or character:FindFirstChild("HumanoidRootPart")
-    if not humanoid or humanoid.Health <= 0 or not root or not root.Parent then return nil end
-    local cf = M.Motion.GetCFrame(character)
-    local velocity = M.Motion.GetVelocity(character) or root.AssemblyLinearVelocity
-    if typeof(cf) ~= "CFrame" or not finiteVector(cf.Position)
-        or not finiteVector(velocity) then return nil end
-    local state = M.Controllers.GetHumanoidState(character, humanoid)
-    local airborne = state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall
-    local floor = M.Grounding.GetStandingY(humanoid, root)
-    if not finite(floor) then floor = cf.Position.Y end
-    local body = { cf = cf, velocity = velocity, horizontal = flat(velocity),
-        floor = floor, airborne = airborne, gravity = math.max(0, f.gravity) }
-    local landing = airborne and holdLandingTime({ receiveAirborne = true,
-        rootCF = cf, velocity = velocity, floorY = floor, gravity = body.gravity }) or 0
-    -- Match Receiving.GetReceiveHitbox, including the transition at landing.
-    -- Use its exact oval, without inflating proximity into a predicted touch.
-    local groundBox = M.Hitboxes.ExtendToFeet(M.Hitboxes.Receive, humanoid, root)
-    local airBox = airborne and M.Hitboxes.ExtendToFeet(M.Hitboxes.AirReceive, humanoid, root) or nil
-    local initialBox = airBox or groundBox
-    actor = actor or M.Actors.GetFromCharacter(character)
-    local kicker = actor and finite(actor.UserId) and actor.UserId == f.lastKickerUserId
-    local leavingKicker = kicker and M.Hitboxes.ContainsPoint({ CFrame = cf }, initialBox, points[1].p)
-
-    -- Reject distant bodies before running native swept-oval intersection.
-    local reach = initialBox.Size.Magnitude * 0.5 + initialBox.CFrameOffset.Position.Magnitude
-    local endRoot = KeeperTiming.RootAt(body, limit).Position
-    local lowX, highX = math.min(cf.Position.X, endRoot.X) - reach, math.max(cf.Position.X, endRoot.X) + reach
-    local lowZ, highZ = math.min(cf.Position.Z, endRoot.Z) - reach, math.max(cf.Position.Z, endRoot.Z) + reach
-    local possible = false
-    for i = 2, #points do
-        local a, b = points[i - 1], points[i]
-        if a.t >= limit then break end
-        if math.max(a.p.X, b.p.X) >= lowX and math.min(a.p.X, b.p.X) <= highX
-            and math.max(a.p.Z, b.p.Z) >= lowZ and math.min(a.p.Z, b.p.Z) <= highZ then
-            possible = true; break
-        end
-    end
-    if not possible then return nil end
-
-    for i = 2, #points do
-        local left, right = points[i - 1], points[i]
-        if left.t >= limit then break end
-        local start, stop = left.t, math.min(limit, right.t)
-        while start < stop do
-            local inAir = airBox ~= nil and start < landing
-            local finish = inAir and math.min(stop, landing) or stop
-            local box = inAir and airBox or groundBox
-            local width = right.t - left.t
-            local a = left.p:Lerp(right.p, (start - left.t) / width)
-            local b = left.p:Lerp(right.p, (finish - left.t) / width)
-            local r0, r1 = KeeperTiming.RootAt(body, start), KeeperTiming.RootAt(body, finish)
-            if leavingKicker then
-                -- The ball leaving its shooter is not a future reception.
-                -- A later re-entry after it leaves the oval is still checked.
-                leavingKicker = M.Hitboxes.ContainsPoint({ CFrame = r1 }, box, b)
-            else
-                local alpha = M.Hitboxes.GetSegmentEnterAlpha({ CFrame = r1 }, box,
-                    a + r1.Position - r0.Position, b)
-                if finite(alpha) and alpha >= 0 and alpha <= 1 then
-                    local time = start + (finish - start) * alpha
-                    if time < limit and (not inAir or time < landing) then
-                        return { character = character, time = time }
-                    end
-                end
-            end
-            start = finish
-        end
-    end
-    return nil
-end
-
-function KeeperTiming.FindContact(f, plan, points)
-    local limit = math.min(KeeperTiming.ForecastSeconds,
-        plan.contact.time - KeeperTiming.ContactOrderMarginSeconds,
-        f.eta - Config.GoalMarginSeconds)
-    if limit <= 0 or M.Motion.GetContext(f.character) == nil then return nil end
-    local seen, best = {}, nil
-    local function add(character, actor)
-        if not character or character == f.character or seen[character] then return end
-        seen[character] = true
-        -- A missing/incompatible opponent rig cannot disable goalkeeper saves.
-        local ok, hit = pcall(KeeperTiming.PlayerContact, f, character, actor, points,
-            best and math.min(limit, best.time) or limit)
-        if ok and hit then best = hit
-        elseif not ok then
-            S.keeperTimingErrors = (S.keeperTimingErrors or 0) + 1
-            S.keeperTimingError = tostring(hit)
-        end
-    end
-    for _, player in ipairs(Players:GetPlayers()) do add(player.Character, player) end
-    local characters = workspace:FindFirstChild("Characters")
-    local function addChildren(container)
-        if not container then return end
-        for _, child in ipairs(container:GetChildren()) do
-            if child:IsA("Model") then add(child) end
-        end
-    end
-    addChildren(characters)
-    addChildren(characters and characters:FindFirstChild("Players"))
-    addChildren(characters and characters:FindFirstChild("NPCs"))
-    return best
-end
-
-function KeeperTiming.SameWindow(f, window)
-    return window and window.character == f.character and window.root == f.root
-        and window.ballId == f.ballId and window.flightKey == f.flightKey and window.world == f.world
-        and window.goal == f.context.goal and window.team == f.context.team
-        and sameTrajectory(window.trajectory, f.sourceTrajectory)
-end
-
-function KeeperTiming.Refine(f, immediate, points)
-    if not KeeperTiming.SameWindow(f, S.keeperWait) then S.keeperWait = nil end
-    S.keeperContact = nil
-    if not immediate or immediate.kind ~= "DIVE" or immediate.delay ~= 0 then return immediate end
-    local reserve = KeeperTiming.LaunchReserveSeconds
-    local clock = math.max(f.readClock, os.clock())
-    if f.eta <= KeeperTiming.UrgentGoalSeconds or immediate.contact.time <= reserve
-        or (S.keeperWait and clock >= S.keeperWait.deadline - KeeperTiming.MinimumWaitSeconds) then
-        return immediate
-    end
-    local hit = KeeperTiming.FindContact(f, immediate, points)
-    S.keeperContact = hit
-    if not hit then return immediate end
-
-    -- Compare actual native contact paths. Do not infer that reachability is
-    -- monotonic: curves and airborne contacts can have separate valid windows.
-    local latest, candidates = nil, {}
-    local minimumClearance = math.min(0.12, immediate.contact.clearance)
-    for _, delay in ipairs(KeeperTiming.Delays) do
-        if delay < f.eta - Config.GoalMarginSeconds - reserve then
-            S.delayedPlansChecked = (S.delayedPlansChecked or 0) + 1
-            local candidate = evaluateDive(f, "DIVE", delay, immediate.name, points)
-            if candidate and candidate.contact.clearance >= minimumClearance then
-                candidates[#candidates + 1] = candidate
-                latest = candidate
-            end
-        end
-    end
-    if not latest then return immediate end
-    local safeDelay = latest.delay - reserve
-    if S.keeperWait then safeDelay = math.min(safeDelay, S.keeperWait.deadline - f.readClock) end
-    if safeDelay <= KeeperTiming.MinimumWaitSeconds or safeDelay <= clock - f.readClock then return immediate end
-
-    -- Validate the reserved launch itself; an earlier launch is not necessarily
-    -- valid just because a later launch was. Fall back to another verified path.
-    S.delayedPlansChecked = (S.delayedPlansChecked or 0) + 1
-    local selected = evaluateDive(f, "DIVE", safeDelay, immediate.name, points)
-    if not selected or selected.contact.clearance < minimumClearance then
-        selected = nil
-        for i = #candidates, 1, -1 do
-            if candidates[i].delay <= safeDelay + 0.000001 then selected = candidates[i]; break end
-        end
-    end
-    if not selected or selected.delay <= KeeperTiming.MinimumWaitSeconds
-        or selected.delay <= clock - f.readClock then return immediate end
-
-    local deadline = f.readClock + selected.delay
-    if deadline <= os.clock() + KeeperTiming.MinimumWaitSeconds then return immediate end
-    if not S.keeperWait then
-        S.keeperWait = { character = f.character, root = f.root, ballId = f.ballId,
-            flightKey = f.flightKey, world = f.world, goal = f.context.goal, team = f.context.team,
-            trajectory = f.sourceTrajectory, deadline = deadline }
-        S.keeperWaits = (S.keeperWaits or 0) + 1
-    else
-        -- The deadline may tighten, but never slides later on repeated samples.
-        S.keeperWait.deadline = math.min(S.keeperWait.deadline, deadline)
-    end
-    selected.waitForContact = true
-    return selected
-end
-
-function KeeperTiming.Protect(f, plan, points)
-    local ok, result = pcall(KeeperTiming.Refine, f, plan, points)
-    if ok then return result end
-    S.keeperTimingErrors = (S.keeperTimingErrors or 0) + 1
-    S.keeperTimingError = tostring(result)
-    return plan
-end
-
 local function planSave(f)
     local began = os.clock()
 
@@ -2732,7 +2401,7 @@ local function planSave(f)
     end
 
     if #candidates > 0 then
-        return finish(KeeperTiming.Protect(f, choosePlan(candidates), points))
+        return finish(choosePlan(candidates))
     end
 
     local possible = {}
@@ -3399,22 +3068,6 @@ local function requestDive(f, plan)
         return false
     end
 
-    commit.contact = hit
-    local timed = KeeperTiming.Protect(fresh, commit, flight)
-    if timed.delay > 0 then
-        S.lastFrame = fresh
-        trackPlanWindow(fresh, timed)
-        S.nextPlanAt = plannerDeadline(fresh)
-        S.allowPositioning = true
-        status("TIMING DIVE " .. timed.name, "Rechecking receiver/blocker before committing")
-        return false
-    end
-    if os.clock() - fresh.readClock > 0.09 then
-        S.nextPlanAt = 0
-        status("REPLAN", "Final contact sample expired")
-        return false
-    end
-
     local exclusions = { fresh.character }
     local renderedBall = M.Renderer.GetBall()
 
@@ -3706,6 +3359,13 @@ local function position(f, dt)
         and remaining > 0
         and f.goalPosition ~= nil
 
+    -- In SIDES mode, do not pre-steer laterally while a shot threat is active.
+    -- This prevents an opposite-side correction (A/D) before the actual dive.
+    if Config.DiveFilter == "SIDES" and threat and not S.jump then
+        releaseMove(true)
+        return
+    end
+
     local coverage = f.isCoverage == true
 
     if coverage and not Config.PreShotCoverage then
@@ -3965,15 +3625,6 @@ connect(StateRemote.OnClientEvent, function(payload)
 
         if payload.BallId == M.Renderer.GetMatchBallId() then
             S.nextPlanAt = 0
-            local revision = payload.Kind == "Movement" and trajectoryStamp(payload.State) or nil
-            local identified = revision and (revision.movementSequence ~= nil
-                or revision.actionId ~= nil or revision.flightStartedAt ~= nil)
-            -- A rebased copy of the same server trajectory may wake the planner,
-            -- but must not restart its absolute launch deadline.
-            if not (identified and S.keeperWait and sameTrajectory(S.keeperWait.trajectory, revision)) then
-                S.keeperWait = nil
-                S.keeperContact = nil
-            end
         end
 
         return
@@ -7460,9 +7111,6 @@ local function createStriker(d)
         if session and not A.SmartRelease then session.smartRelease = false end
         return true
     end
-    -- Compatibility API used by the surrounding Dmc UI/config layer.
-    -- This does not alter the v18 Best Shot engine; it only exposes the
-    -- assist-distance setting that the host UI expects.
     function A.GetAssistRange()
         return C.MaxAssistDistance
     end
@@ -8999,7 +8647,7 @@ for _, remote in ipairs(BallRemotes:GetChildren()) do
 end
 local EVALUATION = createStrikerEvaluation({
     M = M, Player = LocalPlayer, Players = Players, Run = RunService, State = StateRemote,
-    build = "Dmc 0.26 client stamina restored",
+    build = "Dmc 0.23 startup and shot selection",
     sessionId = game:GetService("HttpService"):GenerateGUID(false),
     CommandRemotes = evaluationRemotes, alive = function() return S.alive end,
     timestamp = function() return DateTime.now().UnixTimestampMillis end,
@@ -9010,7 +8658,7 @@ ENV.DmcEvaluationReport = function()
     local http = game:GetService("HttpService")
     local summary = table.clone(result)
     summary.recentShots, summary.recentDribbles, summary.recentEncounters = nil, nil, nil
-    print("[Dmc Evaluation]", http:JSONEncode(summary))
+    print("[Banyu Evaluation]", http:JSONEncode(summary))
     for _, record in ipairs(result.recentShots) do print("[Dmc Shot]", http:JSONEncode(record)) end
     for _, record in ipairs(result.recentDribbles) do print("[Dmc Dribble]", http:JSONEncode(record)) end
     for _, record in ipairs(result.recentEncounters) do print("[Dmc Encounter]", http:JSONEncode(record)) end
@@ -9018,23 +8666,23 @@ ENV.DmcEvaluationReport = function()
 end
 ENV.DmcBeginTrial = function(label, scenario)
     local ok, detail = EVALUATION.BeginTrial(label, scenario)
-    print("[Dmc Evaluation]", ok and "Run started" or "Not started", detail)
+    print("[Banyu Evaluation]", ok and "Run started" or "Not started", detail)
     return ok, detail
 end
 ENV.DmcEndTrial = function()
     local ok, detail = EVALUATION.EndTrial()
-    print("[Dmc Evaluation]", ok and "Run ended" or "Not ended", detail)
+    print("[Banyu Evaluation]", ok and "Run ended" or "Not ended", detail)
     return ENV.DmcEvaluationReport()
 end
 ENV.DmcMarkTrial = function(kind, outcomes, trialId)
     local ok, detail = EVALUATION.MarkTrial(kind, outcomes, trialId)
-    print("[Dmc Evaluation]", ok and "Run outcomes recorded" or "Not recorded", detail)
+    print("[Banyu Evaluation]", ok and "Run outcomes recorded" or "Not recorded", detail)
     if ok then return ENV.DmcEvaluationReport() end
     return ok, detail
 end
 ENV.DmcMarkOutcome = function(kind, outcome, id)
     local ok, detail = EVALUATION.Mark(kind, outcome, id)
-    print("[Dmc Evaluation]", ok and "Outcome recorded" or "Not recorded", detail)
+    print("[Banyu Evaluation]", ok and "Outcome recorded" or "Not recorded", detail)
     return ok, detail
 end
 local STR = createStriker({
@@ -9054,54 +8702,16 @@ local MISC = createStrikerMisc({
     Run = RunService, Gui = game:GetService("GuiService"), load = module,
     id = game:GetService("HttpService"):GenerateGUID(false),
     alive = function() return S.alive end,
-    -- Visual UI interactions do not suspend the defensive threat watcher.
-    -- Native text/chat, menu, strike and recovery gates still apply.
     suspended = function() return not S.focused end, evaluation = EVALUATION,
     ignoreManualInput = function(input) return S.isUIInput and S.isUIInput(input) or false end,
     AttackRemotes = evaluationRemotes,
 })
--- Auto sprint owns only the game's native button toggle.
-do
-    local sprint = createAutoSprint({
-        Player = LocalPlayer, Input = UserInputService, Run = RunService,
-        Gui = game:GetService("GuiService"), load = module,
-        alive = function() return S.alive end,
-        suspended = function() return S.uiBusy or not S.focused end,
-        changed = function(state) MISC.AutoSprint, MISC.SprintStatus = state.AutoSprint, state.Status end,
-    })
-    MISC.AutoSprint, MISC.SprintStatus = false, "OFF"
-    MISC.SetAutoSprint = sprint.SetAutoSprint
-    local originalCleanup, originalDebug = MISC.Cleanup, MISC.Debug
-    MISC.Cleanup = function()
-        local sprintCalled, sprintResult = pcall(sprint.Cleanup)
-        local miscCalled, miscResult, miscDetail = pcall(originalCleanup)
-        if not sprintCalled or sprintResult == false then return false, "Auto sprint could not be released" end
-        if not miscCalled then return false, tostring(miscResult) end
-        return miscResult, miscDetail
-    end
-    MISC.Debug = function()
-        local result = originalDebug()
-        result.autoSprint, result.sprintStatus, result.sprint = MISC.AutoSprint, MISC.SprintStatus, sprint.Debug()
-        return result
-    end
-end
-
 S.releaseMisc = MISC.Cleanup
-EVALUATION.ConfigureComparison(MISC.ObserveDribbleGate, function()
-    return { bestShot = STR.Enabled, autoCurve = STR.AutoCurve, smartRelease = STR.SmartRelease,
-        autoDribble = MISC.AutoDribble, infiniteStamina = MISC.InfiniteStamina }
-end)
-ENV.DmcMisc = MISC
-ENV.DmcMiscDebug = function()
-    local result = MISC.Debug()
-    print("[Dmc Misc]", game:GetService("HttpService"):JSONEncode(result))
-    return result
-end
 
 --==============================================================
--- INTERFACE CONTROLS
 --==============================================================
-
+-- DMC SETTINGS / NEW UI
+--==============================================================
 local function toggleEnabled(value)
     ENV.AUTO_GK_ENABLED = value == true
     S.nextPlanAt = 0
@@ -9117,10 +8727,6 @@ local function toggleEnabled(value)
         status("OFF", "Manual controls untouched")
     end
 end
-
---==============================================================
--- INTERFACE
---==============================================================
 
 local function buildDmcInterface() -- own function: Luau allows max 200 active locals per function
     local oldGui = PlayerGui:FindFirstChild("AutoGKInterface")
@@ -9261,7 +8867,7 @@ local function buildDmcInterface() -- own function: Luau allows max 200 active l
     local header = frame(panel, "DragHandle", 12, 0, 224, 40)
     header.BackgroundTransparency = 1
     header.Active = true
-    text(header, "Dmc", 13, {
+    text(header, "Banyu", 13, {
         Name = "PageTitle", Size = UDim2.fromScale(1, 1),
         Font = Enum.Font.FredokaOne,
     })
@@ -9719,7 +9325,7 @@ local function buildDmcInterface() -- own function: Luau allows max 200 active l
             { value = "FORWARD", label = "Forward" },
             { value = "LEFT", label = "Left" },
             { value = "RIGHT", label = "Right" },
-            { value = "SIDES", label = "Sides" },
+            { value = "SIDES", label = "SafeAuto" },
         },
 
         function()
@@ -9901,7 +9507,6 @@ local function buildDmcInterface() -- own function: Luau allows max 200 active l
     }, activeBody)
     order = 0
     toggle("Auto dribble", function() return MISC.AutoDribble end, MISC.SetAutoDribble)
-    toggle("Auto sprint", function() return MISC.AutoSprint end, MISC.SetAutoSprint)
     toggle("Infinite stamina", function() return MISC.InfiniteStamina end, MISC.SetInfiniteStamina)
     local strikerStatus = text(strikerContent, "OFF", 11, {
         Name = "StrikerStatus", Position = UDim2.fromOffset(8, 327),
@@ -10578,7 +10183,6 @@ local function buildDmcInterface() -- own function: Luau allows max 200 active l
     refresh()
 end
 
-buildDmcInterface()
 
 --==============================================================
 -- SHUTDOWN
@@ -10643,11 +10247,6 @@ ENV.AutoGKDebug = function()
         "| delayed candidates:", S.delayedPlansChecked,
         "| milliseconds:", S.plannerMilliseconds
     )
-    print("[Auto GK] contact timing waits:", S.keeperWaits or 0,
-        "| deadline:", S.keeperWait and math.max(0, S.keeperWait.deadline - os.clock()) or 0,
-        "| intervening contact:", S.keeperContact and S.keeperContact.time or "none",
-        "| timing errors:", S.keeperTimingErrors or 0,
-        "| last timing error:", S.keeperTimingError or "none")
 
     print(
         "[Auto GK] close-range rush:", Config.CloseRangeRush,
@@ -10774,10 +10373,18 @@ ENV.AutoGKDebug = function()
             )
         end
     end
+
+    -- Start hidden; RightShift still toggles the UI open/closed.
+    if SafeConfig.UIStartHidden then
+        Gui.Enabled = false
+    end
 end
 
-SettingsStore.Acknowledge()
-print("[Dmc] Loaded | " .. RELEASE_VERSION .. " | RightShift: show / hide")
+buildDmcInterface()
 
--- DMC MAIN END
+SettingsStore.Acknowledge()
+
+print("[Auto GK] Loaded | RightShift: show / hide | UI starts hidden")
+
+-- BANYU MAIN END
 end)
