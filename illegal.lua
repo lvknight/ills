@@ -5319,13 +5319,15 @@ end)
 
 -- STR: native aim input, bounded search, keeper and defender reach estimates.
 local function createStriker(d)
-    local A = { Enabled = false, AutoCurve = false, SmartRelease = false, Ready = false, Status = "OFF", Detail = "", LastError = nil }
+    local A = { Enabled = false, AutoCurve = false, SmartRelease = false, FlickAssist = false, FlickSmoothness = 6, Ready = false, Status = "OFF", Detail = "", LastError = nil }
     local C = { SliceMs = 2.5, CallsPerSlice = 4, Horizon = 2.2, Step = 0.035,
         SampleHz = 30, CandidateAge = 0.35, NetworkMargin = 0.10, EdgeMargin = 0.65, TargetSlack = 0.35,
         MaxAssistDistance = 55, ClearGapThreshold = 0.75, VolleyPrepareSeconds = 0.30,
-        BestShotRedirectStart = 0.60, BestShotRedirectFull = 0.72,
-        ReleaseInterval = 0.05, ReleaseMargin = 0.35, ReleaseBudgetMs = 2.5 }
-    local stats = { shots = 0, assisted = 0, redirected = 0, confirmed = 0, rejected = 0, candidates = 0, evaluations = 0,
+        ReleaseInterval = 0.05, ReleaseMargin = 0.35, ReleaseBudgetMs = 2.5,
+        FlickTriggerCharge = 0.80, FlickCenterThreshold = 0.22, FlickKeeperDeadzone = 0.70,
+        FlickMaxChecks = 5, FlickEdgeInset = 0.94, FlickFallbackInset = 0.82,
+        BestShotMaxChecks = 12, BestShotPrepareCharge = 0.45, BestShotSwitchCharge = 0.60 }
+    local stats = { shots = 0, assisted = 0, redirected = 0, flicks = 0, confirmed = 0, rejected = 0, candidates = 0, evaluations = 0,
         errors = 0, maxSliceMs = 0, maxAimMs = 0, lastCharge = 0, lastCurve = 0,
         releaseChecks = 0, releaseBudgetSkips = 0, releaseRequests = 0, autoReleases = 0, maxReleaseMs = 0 }
     local recentShots = {}
@@ -5445,7 +5447,7 @@ local function createStriker(d)
         local lateral = forward:Cross(UP)
         local depth = math.abs(forward:Dot(cf.RightVector)) * size.X / 2
             + math.abs(forward:Dot(cf.LookVector)) * size.Z / 2
-        return { center = goal.Position, plane = goal.Position + forward * depth, depth = depth * 2,
+        return { center = goal.Position, plane = goal.Position + forward * depth,
             forward = forward, lateral = lateral,
             halfWidth = (math.abs(lateral:Dot(cf.RightVector)) * size.X
                 + math.abs(lateral:Dot(cf.LookVector)) * size.Z) / 2,
@@ -5638,7 +5640,6 @@ local function createStriker(d)
         local curve = N.Curves.IsEnabled() and (session.curve or 0) or 0
         local keepers, defenders = keepersFor(ch, team, goal, practiceGoals)
         return { character = ch, root = root, origin = origin, velocity = velocity,
-            verticalSpeed = math.abs(root.AssemblyLinearVelocity.Y),
             sample = sample, goal = goal, goalCF = goal.CFrame, world = world, mouth = mouth,
             charge = approachingLock and maximum or charge, charges = charges,
             minimumCharge = minimum, maximumCharge = maximum,
@@ -6027,52 +6028,6 @@ local function createStriker(d)
         local width = math.clamp(math.abs((position - mouth.center):Dot(mouth.lateral)) / math.max(mouth.halfWidth, 0.01), 0, 1)
         return 0.20 * height * width
     end
-    local function crossbarMargin(f)
-        if not (f.volley or f.sample.IsAirborne) then return C.EdgeMargin end
-        -- Airborne carry/camera samples and the actual strike can land on different
-        -- update ticks. Reserve one aim-update interval of vertical travel, with
-        -- bounded extra headroom; do not lower ordinary grounded shot targets.
-        local dt = 1 / C.SampleHz
-        local motion = (f.verticalSpeed or 0) * dt + workspace.Gravity * dt * dt / 2
-        return C.EdgeMargin + math.clamp(C.TargetSlack + motion, C.TargetSlack, 1.5)
-    end
-    local function crossbarSweep(f, first, second)
-        -- Clip the swept segment to the frame vicinity. On approach only the
-        -- spherical cap overlaps the front plane: a steep descending volley can
-        -- strike the bar before its center reaches the otherwise-safe entry.
-        local mouth, radius = f.mouth, f.radius
-        local a = (first - mouth.plane):Dot(mouth.forward)
-        local b = (second - mouth.plane):Dot(mouth.forward)
-        local rear = -(math.min(mouth.depth or 0, 2 * radius) + radius)
-        local lo, hi = 0, 1
-        local delta = b - a
-        if math.abs(delta) < 1e-6 then
-            if a > radius or a < rear then return nil end
-        else
-            local frontT, rearT = (radius - a) / delta, (rear - a) / delta
-            lo, hi = math.max(0, math.min(frontT, rearT)), math.min(1, math.max(frontT, rearT))
-            if lo > hi then return nil end
-        end
-        local best
-        local function consider(t)
-            if t < lo or t > hi then return end
-            local p = first:Lerp(second, t)
-            local depth = math.max(0, a + delta * t)
-            local cap = math.sqrt(math.max(0, radius * radius - depth * depth))
-            local adjusted = Vector3.new(p.X, p.Y + cap - radius, p.Z)
-            if not best or adjusted.Y > best.Y then best = adjusted end
-        end
-        consider(lo); consider(hi)
-        if math.abs(delta) > 1e-6 then
-            consider(-a / delta)
-            local slope = (second.Y - first.Y) / delta
-            if slope > 0 then
-                local peakDepth = radius * slope / math.sqrt(1 + slope * slope)
-                consider((peakDepth - a) / delta)
-            end
-        end
-        return best
-    end
     local function validate(f, aim, charge, yielding)
         local velocity, spin = launch(f, aim, charge)
         if yielding then coroutine.yield() end
@@ -6085,13 +6040,11 @@ local function createStriker(d)
         local eta = time - launchAt
         if eta <= 0 or eta > C.Horizon then return nil end
         local mouth = f.mouth
-        local topLimit = mouth.top - f.radius - crossbarMargin(f)
         local edge = math.min(mouth.halfWidth - math.abs((position - mouth.center):Dot(mouth.lateral)), mouth.top - position.Y)
         -- Keep the whole ball inside the opening, not just its centre. The same
         -- check is used for current aim, searched candidates and smart release.
         if position.Y < mouth.bottom then return nil end
         if edge - f.radius < C.EdgeMargin then return nil, position end
-        if position.Y > topLimit then return nil, position end
         local minGap, minDemand, minDifficulty, previous = math.huge, math.huge, math.huge, f.origin
         local defenderReach, defenderRisk, previousT = math.huge, 0, 0
         local cursor = state
@@ -6103,8 +6056,6 @@ local function createStriker(d)
             cursor = d.M.Physics.GetStateAtTime(cursor, launchAt + t, f.world, {})
             if not cursor or not vec(cursor.Position) then return nil end
             if hasObstruction(f, cursor.BoundaryHits) then return nil end
-            local barPoint = crossbarSweep(f, previous, cursor.Position)
-            if barPoint and barPoint.Y > topLimit then return nil, barPoint end
             minGap = math.min(minGap, keeperGap(f, previous, cursor.Position, t))
             local demand, difficulty = reachDemand(f, previous, cursor.Position, t)
             minDemand, minDifficulty = math.min(minDemand, demand), math.min(minDifficulty, difficulty)
@@ -6119,36 +6070,6 @@ local function createStriker(d)
         edge = math.min(edge, mouth.halfWidth - math.abs((cursor.Position - mouth.center):Dot(mouth.lateral)),
             mouth.top - cursor.Position.Y)
         if edge - f.radius < C.EdgeMargin then return nil, cursor.Position end
-        if cursor.Position.Y > topLimit then return nil, cursor.Position end
-        -- FirstBoxEntry reports the center entering the scoring volume. The ball
-        -- can still rise into the bar or bend into a post immediately afterward.
-        -- Follow it through the mouth (at most one ball diameter of goal depth)
-        -- until its trailing edge clears. Do not simulate on to the back net.
-        local clearanceDepth = math.min(mouth.depth or 0, 2 * f.radius) + f.radius
-        local passageTime = eta
-        for _ = 1, 8 do
-            local remaining = (cursor.Position - mouth.plane):Dot(mouth.forward) + clearanceDepth
-            if remaining <= 1e-4 then break end
-            local motion = vec(cursor.Velocity) and cursor.Velocity or velocity
-            local inward = -motion:Dot(mouth.forward)
-            if inward <= 1e-4 then return nil end
-            local dt = math.min(C.Step, math.max(0.001, remaining / inward))
-            passageTime += dt
-            local passageStart = cursor.Position
-            cursor = d.M.Physics.GetStateAtTime(cursor, launchAt + passageTime, f.world, {})
-            if not cursor or not vec(cursor.Position) then return nil end
-            if hasObstruction(f, cursor.BoundaryHits) then
-                -- Use the unreflected flight only as a repair hint. The repaired
-                -- direction must pass the complete native collision check again.
-                return nil, d.M.Physics.GetAirFlight(f.origin, velocity, spin, passageTime)
-            end
-            -- Do not depend on the preview world including the crossbar solid.
-            -- A rising volley must stay below it throughout the frame passage,
-            -- not merely at the first center-entry sample.
-            local barPoint = crossbarSweep(f, passageStart, cursor.Position)
-            if barPoint and barPoint.Y > topLimit then return nil, barPoint end
-        end
-        if (cursor.Position - mouth.plane):Dot(mouth.forward) + clearanceDepth > 1e-4 then return nil end
         if #f.keepers == 0 then minGap, minDemand, minDifficulty = nil, nil, nil end
         return { gap = minGap, reachDemand = minDemand, difficulty = minDifficulty, predictionCharge = charge,
             score = (minDifficulty and (minDifficulty - 1) * d.M.Dive.Constants.Distance or 0)
@@ -6231,12 +6152,11 @@ local function createStriker(d)
         -- two-proposal limit. This approximation never authorizes an aim by itself.
         local mouth = f.mouth
         local inset = f.radius + C.EdgeMargin + C.TargetSlack
-        local topInset = f.radius + crossbarMargin(f) + C.TargetSlack
         local half = mouth.halfWidth - inset
-        if half <= 0 or mouth.top - topInset <= mouth.bottom + f.radius then return nil end
+        if half <= 0 or mouth.top - inset <= mouth.bottom + f.radius then return nil end
         local x = (position - mouth.center):Dot(mouth.lateral)
         local shift = mouth.lateral * (math.clamp(x, -half, half) - x)
-            + UP * math.min(0, mouth.top - topInset - position.Y)
+            + UP * math.min(0, mouth.top - inset - position.Y)
         local origin = f.sample.Origin + (f.aimOffset or V0)
         local distance = (origin - mouth.plane):Dot(mouth.forward)
         local ballDistance = (f.origin - mouth.plane):Dot(mouth.forward)
@@ -6251,16 +6171,11 @@ local function createStriker(d)
         local point = mouth.center + mouth.lateral * target.X
         return Vector3.new(point.X, target.Y, point.Z)
     end
-    local function shotZone(mouth, point)
-        local x = (point - mouth.center):Dot(mouth.lateral)
-        local height = (point.Y - mouth.bottom) / math.max(mouth.top - mouth.bottom, 0.01)
-        local level = height < 1 / 3 and "LOW" or (height > 2 / 3 and "HIGH" or "MID")
-        -- mouth.lateral points left when looking into the goal.
-        local side = x > mouth.halfWidth / 3 and "LEFT" or (x < -mouth.halfWidth / 3 and "RIGHT" or "CENTER")
-        return level .. " " .. side
-    end
+    -- Best Shot Assist: hard far-side policy. A target is only eligible when it
+    -- is clearly on the side opposite the goalkeeper; center/keeper-head targets
+    -- are never used as a fallback.
     local function preferredShotSide(f)
-        if not f or not f.mouth or #f.keepers == 0 then return 1 end
+        if not f or not f.mouth or not f.keepers or #f.keepers == 0 then return 0 end
         local weighted, total = 0, 0
         for _, keeper in ipairs(f.keepers) do
             local x = (keeper.position - f.mouth.center):Dot(f.mouth.lateral)
@@ -6273,12 +6188,11 @@ local function createStriker(d)
         if bias > deadzone then return -1 end
         if bias < -deadzone then return 1 end
 
-        -- If the keeper is centered, compare the two outer lanes by the
-        -- existing reach model. This does not run a new trajectory solve.
+        -- Centered keeper: compare modeled reach at the two far-side points.
         local inset = f.radius + C.EdgeMargin + C.TargetSlack
         local half = math.max(0, f.mouth.halfWidth - inset)
         local low = f.mouth.bottom + f.radius + 0.4
-        local high = f.mouth.top - f.radius - crossbarMargin(f) - C.TargetSlack
+        local high = f.mouth.top - inset
         if half > 0 and high > low then
             local y = low + (high - low) * 0.55
             local left = targetPoint(f.mouth, Vector2.new(half * 0.72, y))
@@ -6294,19 +6208,23 @@ local function createStriker(d)
     end
 
     local function bestShotTargetAllowed(f, rating, side)
-        if not f or not rating or not rating.position or side == 0 then return false end
+        if not f or not rating or not vec(rating.position) or side == 0 then return false end
         local half = math.max(f.mouth.halfWidth, 0.01)
         local x = (rating.position - f.mouth.center):Dot(f.mouth.lateral)
-        -- Never accept the centre lane or the keeper's side.
+        -- Hard center exclusion: never accept a target near the keeper's lane.
         if x * side < half * 0.34 then return false end
 
         local nearestKeeper = math.huge
         for _, keeper in ipairs(f.keepers or {}) do
             local kx = (keeper.position - f.mouth.center):Dot(f.mouth.lateral)
-            nearestKeeper = math.min(nearestKeeper, math.abs(x - kx))
+            local lateralGap = math.abs(x - kx)
+            nearestKeeper = math.min(nearestKeeper, lateralGap)
         end
+        -- Require a substantial lateral separation from every tracked keeper.
         if nearestKeeper < half * 0.30 then return false end
 
+        -- Do not accept a point directly above the keeper while it remains in the
+        -- same lateral lane. High corners on the far side are still allowed.
         for _, keeper in ipairs(f.keepers or {}) do
             local kx = (keeper.position - f.mouth.center):Dot(f.mouth.lateral)
             if math.abs(x - kx) < half * 0.42
@@ -6317,25 +6235,158 @@ local function createStriker(d)
         return true
     end
 
+    local function shotZone(mouth, point)
+        local x = (point - mouth.center):Dot(mouth.lateral)
+        local height = (point.Y - mouth.bottom) / math.max(mouth.top - mouth.bottom, 0.01)
+        local level = height < 1 / 3 and "LOW" or (height > 2 / 3 and "HIGH" or "MID")
+        -- mouth.lateral points left when looking into the goal.
+        local side = x > mouth.halfWidth / 3 and "LEFT" or (x < -mouth.halfWidth / 3 and "RIGHT" or "CENTER")
+        return level .. " " .. side
+    end
+    -- Flick Assist uses the same physical goal plane as Shoot Assist. The player's
+    -- current ray is classified first; only then do we choose the opposite lane.
+    -- Flick starts only when the native charge reaches 80%. Higher smoothness
+    -- spreads the direction transition over a larger part of the final charge.
+    local function flickBlendAlpha(f)
+        if not A.FlickAssist or not f or f.volley then return 0 end
+        local maximum = math.max(f.maximumCharge or 0, 1e-4)
+        local progress = math.clamp((f.elapsed or 0) / maximum, 0, 1)
+        if progress < C.FlickTriggerCharge then return 0 end
+        local smoothness = math.clamp(math.floor(tonumber(A.FlickSmoothness) or 6), 1, 10)
+        local window = 0.035 + (smoothness - 1) * 0.018
+        local t = math.clamp((progress - C.FlickTriggerCharge) / window, 0, 1)
+        -- Smoothstep keeps the first movement gentle and finishes decisively.
+        return t * t * (3 - 2 * t)
+    end
+
+    local function flickAimSide(f, sample)
+        if not A.FlickAssist or not f or not f.mouth or typeof(sample) ~= "table"
+            or not vec(sample.Origin) or not vec(sample.Direction) then return 0 end
+        local origin = sample.Origin + (f.aimOffset or V0)
+        local denominator = sample.Direction:Dot(f.mouth.forward)
+        if math.abs(denominator) < 1e-5 then return 0 end
+        local distance = (f.mouth.plane - origin):Dot(f.mouth.forward) / denominator
+        if distance <= 0 then return 0 end
+        local point = origin + sample.Direction * distance
+        local x = (point - f.mouth.center):Dot(f.mouth.lateral)
+        local threshold = f.mouth.halfWidth * C.FlickCenterThreshold
+        if x > threshold then return 1 end -- LEFT
+        if x < -threshold then return -1 end -- RIGHT
+        return 0 -- CENTER
+    end
+
+    -- For a center aim, inspect the actual keeper snapshots already collected by
+    -- Shoot Assist. Positive means the keeper is left of the goal center.
+    local function keeperBias(f)
+        -- First use the same reach-demand model used to score Shoot Assist targets.
+        -- Higher difficulty means the keeper needs more of its reachable envelope.
+        local inset = f.radius + C.EdgeMargin + C.TargetSlack
+        local half = math.max(0, f.mouth.halfWidth - inset)
+        local low = f.mouth.bottom + f.radius + 0.4
+        local high = f.mouth.top - inset
+        if half > 0 and high > low then
+            local y = (low + high) * 0.5
+            local leftPoint = targetPoint(f.mouth, Vector2.new(half * 0.72, y))
+            local rightPoint = targetPoint(f.mouth, Vector2.new(-half * 0.72, y))
+            local speed = (N.Shoot.Constants.Shot and N.Shoot.Constants.Shot.MaximumSpeed) or 123
+            local leftEta = (leftPoint - f.origin).Magnitude / math.max(speed, 1)
+            local rightEta = (rightPoint - f.origin).Magnitude / math.max(speed, 1)
+            local _, leftDifficulty = reachDemand(f, leftPoint, leftPoint, leftEta)
+            local _, rightDifficulty = reachDemand(f, rightPoint, rightPoint, rightEta)
+            if leftDifficulty and rightDifficulty
+                and math.abs(leftDifficulty - rightDifficulty) > 0.08 then
+                return leftDifficulty > rightDifficulty and 1 or -1
+            end
+        end
+
+        -- Fallback for a temporarily incomplete reach profile: use keeper location.
+        local left, right = 0, 0
+        for _, keeper in ipairs(f.keepers or {}) do
+            local x = (keeper.position - f.mouth.center):Dot(f.mouth.lateral)
+            if x > C.FlickKeeperDeadzone then
+                left += 1 + math.min(1, math.abs(x) / math.max(f.mouth.halfWidth, 0.01))
+            elseif x < -C.FlickKeeperDeadzone then
+                right += 1 + math.min(1, math.abs(x) / math.max(f.mouth.halfWidth, 0.01))
+            end
+        end
+        if left > right + 0.25 then return -1 end
+        if right > left + 0.25 then return 1 end
+        return 0
+    end
+
+    local function flickTargetSide(f, sample)
+        local aimed = flickAimSide(f, sample)
+        if aimed ~= 0 then return -aimed end
+        -- Center: use keeper location first. If the keeper is centered/equidistant,
+        -- randomize between the two sides; both choices still require rate() validation.
+        local biased = keeperBias(f)
+        if biased ~= 0 then return biased end
+        return math.random(0, 1) == 0 and -1 or 1
+    end
+
+    local function candidateSide(f, candidate)
+        if not f or not candidate or not candidate.rating or not vec(candidate.rating.position) then return 0 end
+        local x = (candidate.rating.position - f.mouth.center):Dot(f.mouth.lateral)
+        local threshold = f.mouth.halfWidth * C.FlickCenterThreshold
+        if x > threshold then return 1 end
+        if x < -threshold then return -1 end
+        return 0
+    end
+
+    -- Build a fresh aim directly on the requested flick lane. This is the
+    -- anti-stuck path: if cached candidates do not contain the opposite side,
+    -- we generate a few fresh edge targets instead of returning the original aim.
+    local function directFlickAim(f, flickSide, xInset, yRatio)
+        if not f or flickSide == 0 or not f.mouth then return nil end
+        local inset = f.radius + C.EdgeMargin + C.TargetSlack
+        local half = f.mouth.halfWidth - inset
+        local low = f.mouth.bottom + f.radius + 0.4
+        local high = f.mouth.top - inset
+        if half <= 0 or high <= low then return nil end
+        local x = half * math.clamp(xInset or C.FlickEdgeInset, 0.55, 0.98) * flickSide
+        local y = low + (high - low) * math.clamp(yRatio or 0.72, 0.20, 0.90)
+        local center = f.mouth.center + f.mouth.lateral * x
+        local point = Vector3.new(center.X, y, center.Z)
+        local origin = f.sample.Origin + (f.aimOffset or V0)
+        local direction = point - origin
+        if not vec(direction) or direction.Magnitude < 1e-5 then return nil end
+        local yaw, pitch = angles(direction.Unit)
+        return aimAt(f, yaw, pitch), point
+    end
+
+    -- Flick targets should not merely cross the goal center. Prefer the far
+    -- post/corner of the selected side, while still letting rate() reject it
+    -- if the route is actually unsafe. This makes the flick finish farther
+    -- from the keeper's reachable envelope instead of stopping near the middle.
+    local function flickEdgeScore(f, candidate, flickSide)
+        if not f or not candidate or not candidate.rating or not vec(candidate.rating.position)
+            or flickSide == 0 then return -math.huge end
+        local offset = candidate.rating.position - f.mouth.center
+        local x = offset:Dot(f.mouth.lateral)
+        local y = offset:Dot(f.mouth.up)
+        local half = math.max(f.mouth.halfWidth, 0.01)
+        local height = math.max(f.mouth.top - f.mouth.bottom, 0.01)
+        local sideAmount = math.clamp((x * flickSide) / half, -1, 1)
+        local heightAmount = math.clamp((y - f.mouth.bottom) / height, 0, 1)
+        -- Side distance is the main goal; a modest high-corner bonus helps
+        -- avoid selecting a reachable mid-height point when the corner exists.
+        return sideAmount * 2.0 + heightAmount * 0.35
+    end
     local function searchTargets(f)
         local mouth = f.mouth
         -- Leave room for the iterative solver's 0.30-stud target tolerance.
         local inset = f.radius + C.EdgeMargin + C.TargetSlack
         local half = mouth.halfWidth - inset
         local low = mouth.bottom + f.radius + 0.4
-        local high = mouth.top - f.radius - crossbarMargin(f) - C.TargetSlack
+        local high = mouth.top - inset
         if half <= 0 or high <= low then return {} end
         local middle = (low + high) / 2
         local targets = {}
-        local side = preferredShotSide(f)
-        local farX = half * side
-        local nearX = half * 0.72 * side
-        -- Best Shot Assist searches only the far-side lanes. Centre and the
-        -- keeper-side lanes are intentionally excluded.
-        local xLanes = { farX, nearX }
+        -- Cover all nine height/side combinations, plus the lanes between center and posts.
+        -- Use a cheap reach estimate only to order work; it never authorizes an aim change.
         local speed = (N.Shoot.Constants.Shot and N.Shoot.Constants.Shot.MaximumSpeed) or 123
         for level, height in ipairs({ middle, high, low }) do
-            for _, x in ipairs(xLanes) do
+            for _, x in ipairs({ -half, half, 0, -half * 0.5, half * 0.5 }) do
                 local target = Vector2.new(x, height)
                 local point = targetPoint(mouth, target)
                 local eta = (point - f.origin).Magnitude / math.max(speed, 1)
@@ -6379,14 +6430,7 @@ local function createStriker(d)
             local function retain(atPower, lane, aim)
                 local retained = false
                 if aim then
-                    local rating, edgePosition = rate(atPower, aim, true)
-                    if not rating and edgePosition then
-                        local corrected = insetAim(atPower, aim, edgePosition)
-                        if corrected then
-                            rating = rate(atPower, corrected, true)
-                            if rating then aim = corrected end
-                        end
-                    end
+                    local rating = rate(atPower, aim, true)
                     stats.candidates += 1
                     owner.candidateEvaluations = (owner.candidateEvaluations or 0) + 1
                     if rating and session == owner and A.Enabled then
@@ -6443,20 +6487,23 @@ local function createStriker(d)
             end
             -- Compare straight and both bends at each upper corner before spending
             -- time on more low variants. Each bend gets its own ballistic solve.
-            local curves, seenCurves = { f.curve }, { [f.curve] = true }
+            for index = 1, math.min(2, #targets) do
+                local entry = targets[index]
+                local at = table.clone(solveFrame); at.curve = f.curve
+                seeds[at.curve] = seeds[at.curve] or {}
+                prepare(at, entry, seeds[at.curve])
+            end
             if f.autoCurve then
+                local curves, seenCurves = {}, { [f.curve] = true }
                 for _, curve in ipairs({ -1, 1, 0 }) do
                     if not seenCurves[curve] then curves[#curves + 1] = curve; seenCurves[curve] = true end
                 end
-            end
-            -- The exposed corner gets all three routes first, so a short charge
-            -- can compare a bend with its straight rival before solving the
-            -- keeper's covered corner. Target priority includes keeper reach.
-            for index = 1, math.min(2, #targets) do
                 for _, curve in ipairs(curves) do
-                    local at = table.clone(solveFrame); at.curve = curve
-                    seeds[curve] = seeds[curve] or {}
-                    prepare(at, targets[index], seeds[curve])
+                    for index = 1, math.min(2, #targets) do
+                        local at = table.clone(solveFrame); at.curve = curve
+                        seeds[curve] = seeds[curve] or {}
+                        prepare(at, targets[index], seeds[curve])
+                    end
                 end
             end
             -- A lower bend can be harder when the keeper is well off-center. Give
@@ -6483,8 +6530,8 @@ local function createStriker(d)
             for index, entry in ipairs(targets) do
                 -- Rotate curve variants through later height solves within the same
                 -- coroutine budget. With auto curve off, this is the original search.
-                local curveVariants = f.autoCurve and { f.curve, -1, 1, 0 } or { f.curve }
-                local curve = curveVariants[(index - 1) % #curveVariants + 1]
+                local curves = f.autoCurve and { f.curve, -1, 1, 0 } or { f.curve }
+                local curve = curves[(index - 1) % #curves + 1]
                 local candidateFrame = table.clone(solveFrame); candidateFrame.curve = curve
                 seeds[curve] = seeds[curve] or {}
                 if index > 2 and entry ~= middlePrepared then prepare(candidateFrame, entry, seeds[curve]) end
@@ -6532,10 +6579,15 @@ local function createStriker(d)
     local function choose(sample)
         local owner = session
         if not owner or owner.locked then return sample end
+        local previousFlickSide = owner.flickSide or 0
         owner.pair = nil
         owner.reason = nil
         owner.bestGap = nil
         owner.redirected = false
+        owner.flicked = false
+        owner.flickSide = 0
+        owner.flickAlpha = 0
+        owner.flickDirect = false
         owner.decisionAudit = nil
         owner.completedAlternatives, owner.checkedAlternatives = 0, 0
         local f = frame(sample)
@@ -6555,17 +6607,35 @@ local function createStriker(d)
             setStatus("NO GK DATA", "Normal aim | Keeper reach is unknown")
             return sample
         end
-        local bestShotSide = preferredShotSide(f)
         local normal = rate(f, sample, false)
-        if normal and not bestShotTargetAllowed(f, normal, bestShotSide) then
-            normal = nil
-        end
         owner.rawRating = normal
+        local flickAlpha = flickBlendAlpha(f)
+        local flickSide = flickAlpha > 0
+            and (previousFlickSide ~= 0 and previousFlickSide or flickTargetSide(f, sample))
+            or 0
+        owner.flickSide = flickSide
+        owner.flickAlpha = flickAlpha
+        owner.flickActive = A.FlickAssist and flickSide ~= 0 and flickAlpha > 0
+        local bestShotSide = preferredShotSide(f)
         owner.bestShotSide = bestShotSide
-        if f.charge < C.BestShotRedirectStart then
-            owner.applied, owner.rating, owner.reason = false, nil, "prepare"
-            setStatus("PREPARING BEST SHOT", "Far-side redirect starts at 60% charge")
-            return sample
+        -- Prepare far-side candidates before the actual redirect window.
+        -- This prevents the 60% switch from happening before the validated
+        -- far-side route has finished solving.
+        -- Best Shot timing is percentage-based, not raw seconds.
+        -- This keeps 45%/60% consistent across different native charge lengths.
+        local bestShotPrepareCharge = math.clamp(C.BestShotPrepareCharge or 0.45, 0, 0.90)
+        local bestShotSwitchCharge = math.clamp(C.BestShotSwitchCharge or 0.60, 0, 0.95)
+        local maximumCharge = math.max(f.maximumCharge or 0, 1e-4)
+        local bestShotProgress = math.clamp((f.charge or 0) / maximumCharge, 0, 1)
+        local bestShotPreparing = bestShotProgress >= bestShotPrepareCharge
+        local bestShotReady = bestShotProgress >= bestShotSwitchCharge
+        owner.bestShotPreparing = bestShotPreparing
+        owner.bestShotReady = bestShotReady
+        -- Before 60%, never disturb the player's original aim. At/after 60%,
+        -- only replace it after a far-side candidate has been freshly validated.
+        if normal and not owner.flickActive and bestShotReady
+            and not bestShotTargetAllowed(f, normal, bestShotSide) then
+            normal = nil
         end
         local audit = { scope = "current aim and freshly checked proposals", checked = {}, duplicatesSkipped = 0,
             rawScore = normal and normal.score, rawDefenderRisk = normal and normal.defenderRisk,
@@ -6601,62 +6671,48 @@ local function createStriker(d)
                 owner.validationStage = stage
                 -- Native curve strength changes with charge. Revisit the strongest
                 -- full-power proposals when entering the lock/volley window, then
-                -- continue the existing fair rotation with the same two-check limit.
+                -- validate several independent lanes so Best Shot Assist cannot get
+                -- stuck on the original aim merely because the first two proposals
+                -- were stale, blocked, or from the same side.
                 for _, entry in ipairs(owner.candidates) do entry.checkedAt = nil end
             end
         end
         -- Recheck a completed candidate using current power, launch position and keeper state.
         -- Invalid/stale work never supplies a direction to native shooting.
         local checked, seenAims = 0, {}
+        local maxChecks = owner.flickActive and math.max(3, C.FlickMaxChecks) or math.max(4, C.BestShotMaxChecks or 6)
         local shortlist = table.clone(owner.candidates)
         -- Preserve the chosen route even if the bounded search pool evicts its seed.
         -- It is a proposal only: revalidate it below with current power/world/keeper data.
         local incumbent = choice and choice.candidate or owner.selectedCandidate
         if incumbent then table.insert(shortlist, 1, incumbent) end
         owner.validationPass = (owner.validationPass or 0) + 1
-        local priorities = {}
-        local keeperMoved = false
-        for _, entry in ipairs(shortlist) do
-            local previous = entry.frame and entry.frame.keepers
-            local changed = not previous or #previous ~= #f.keepers
-            for i, keeper in ipairs(f.keepers) do
-                local old = previous and previous[i]
-                if not old or old.character ~= keeper.character or old.position ~= keeper.position
-                    or old.velocity ~= keeper.velocity or old.speed ~= keeper.speed or old.jump ~= keeper.jump
-                    or old.upright ~= keeper.upright then
-                    changed = true; break
+        local prioritizeBest = owner.validationPass % 2 == 0
+        table.sort(shortlist, function(a, b)
+            if flickSide ~= 0 then
+                local as = candidateSide(f, a) == flickSide
+                local bs = candidateSide(f, b) == flickSide
+                if as ~= bs then return as end
+                if as and bs then
+                    -- For a flick, edge/corner placement outranks a merely opposite-side
+                    -- point. Physics validation below still has the final say.
+                    local ae = flickEdgeScore(f, a, flickSide)
+                    local be = flickEdgeScore(f, b, flickSide)
+                    if math.abs(ae - be) > 0.08 then return ae > be end
                 end
             end
-            local rating = entry.rating
-            if changed and previous and #previous > 0 and rating and rating.position and rating.eta then
-                -- Refresh ordering after keeper movement without rerunning every trajectory.
-                -- Preserve each route's flight score, adjusting its endpoint reach estimate.
-                -- This is only a proposal priority; the full current flight is checked below.
-                local before = table.clone(f); before.keepers = previous; before.reachProfiles = nil
-                local _, oldDemand = reachDemand(before, rating.position, rating.position, rating.eta)
-                local _, newDemand = reachDemand(f, rating.position, rating.position, rating.eta)
-                local priority = table.clone(rating)
-                priority.score += (newDemand - oldDemand) * d.M.Dive.Constants.Distance
-                priorities[entry] = priority
-                keeperMoved = true
-            elseif entry.checkedStage == owner.validationStage then
-                priorities[entry] = entry.checkedRating or false
-            else
-                priorities[entry] = rating
-            end
-        end
-        -- Changed coverage needs a fresh rival now; stationary scenes retain fair rotation.
-        local prioritizeBest = keeperMoved or owner.validationPass % 2 == 0
-        table.sort(shortlist, function(a, b)
-            -- Revalidate the previous winner, then fairly visit alternatives. Two stale
-            -- top-ranked proposals must not hide every other lane until aim lock.
+            -- Revalidate the previous winner, then fairly visit alternatives. A bounded
+            -- multi-lane pass prevents two stale top-ranked proposals from hiding
+            -- every other lane until aim lock.
             local incumbent = choice and choice.candidate or owner.selectedCandidate
             if a == incumbent then return b ~= incumbent end
             if b == incumbent then return false end
             -- Alternate strength and age: refresh a strong finished corner promptly,
             -- while stale or invalid leaders cannot permanently hide other lanes.
             if prioritizeBest then
-                local ar, br = priorities[a], priorities[b]
+                local ar, br = a.rating, b.rating
+                if a.checkedStage == owner.validationStage then ar = a.checkedRating end
+                if b.checkedStage == owner.validationStage then br = b.checkedRating end
                 if betterRating(ar, br) then return true end
                 if betterRating(br, ar) then return false end
             end
@@ -6667,13 +6723,37 @@ local function createStriker(d)
             if math.abs(ad - bd) > 1e-5 then return ad < bd end
             return betterRating(a.rating, b.rating)
         end)
+        -- After ranking, deliberately pull one fresh representative from each
+        -- horizontal lane into the front of the bounded validation pass. This is
+        -- what prevents a strong-looking left candidate from consuming every
+        -- validation slot while the right side is never physically checked.
+        if flickSide == 0 and #shortlist > 1 then
+            local lanes, laneSeen = {}, {}
+            local function laneOf(entry)
+                local side = candidateSide(f, entry)
+                return side == 0 and 0 or side
+            end
+            for _, preferredLane in ipairs({ -1, 1, 0 }) do
+                for _, entry in ipairs(shortlist) do
+                    if not laneSeen[entry] and laneOf(entry) == preferredLane then
+                        lanes[#lanes + 1] = entry
+                        laneSeen[entry] = true
+                        break
+                    end
+                end
+            end
+            for _, entry in ipairs(shortlist) do
+                if not laneSeen[entry] then lanes[#lanes + 1] = entry end
+            end
+            shortlist = lanes
+        end
         for _, entry in ipairs(shortlist) do
-            if (requiredCurve == nil or entry.curve == requiredCurve)
+            local wantedLane = flickSide ~= 0
+                and candidateSide(f, entry) == flickSide
+                or (bestShotReady and bestShotTargetAllowed(f, entry.rating, bestShotSide))
+            if wantedLane and (requiredCurve == nil or entry.curve == requiredCurve)
                 and compatible(entry.frame, f) and clock - entry.at <= C.CandidateAge then
                 local aim = candidateAim(entry, f)
-                if not bestShotTargetAllowed(f, entry.rating, bestShotSide) then
-                    continue
-                end
                 local candidateFrame = f
                 if f.autoCurve and entry.curve ~= nil then
                     candidateFrame = table.clone(f); candidateFrame.curve = entry.curve
@@ -6702,7 +6782,7 @@ local function createStriker(d)
                     checkedAt = entry.checkedAt }
                 local rating, edgePosition = rate(candidateFrame, aim, false)
                 local correctedEdge = false
-                if not rating and edgePosition and checked < 2 then
+                if not rating and edgePosition and checked < maxChecks then
                     local corrected = insetAim(candidateFrame, aim, edgePosition)
                     if corrected then
                         checked += 1
@@ -6726,19 +6806,142 @@ local function createStriker(d)
                 if betterRating(rating, best) then
                     chosen, best, selectedCandidate, selectedCurve = aim, rating, entry, candidateFrame.curve
                 end
-                if checked >= 2 then break end
+                if checked >= maxChecks then break end
             end
         end
+        -- Once the redirect window is reached, validate a small deterministic
+        -- far-side set immediately. This is independent of the background solver,
+        -- so a slow/stale candidate queue cannot make Best Shot appear inactive.
+        if not chosen and not owner.flickActive and bestShotReady and bestShotSide ~= 0 then
+            local inset = f.radius + C.EdgeMargin + C.TargetSlack
+            local half = f.mouth.halfWidth - inset
+            local low = f.mouth.bottom + f.radius + 0.4
+            local high = f.mouth.top - inset
+            if half > 0 and high > low then
+                -- Try several heights on the far side. The target itself is checked
+                -- against the keeper before rate(); rate() then only decides whether
+                -- the actual shot physics can reach that target.
+                local bestDirect, bestDirectRating
+                for _, spec in ipairs({
+                    { x = 0.90, y = 0.70 },
+                    { x = 0.78, y = 0.52 },
+                    { x = 0.64, y = 0.35 },
+                    { x = 0.92, y = 0.88 },
+                }) do
+                    local point = targetPoint(f.mouth, Vector2.new(half * spec.x * bestShotSide, low + (high - low) * spec.y))
+                    local pointSide = (point - f.mouth.center):Dot(f.mouth.lateral)
+                    local targetAllowed = pointSide * bestShotSide >= f.mouth.halfWidth * 0.34
+                    if targetAllowed then
+                        local origin = f.sample.Origin + (f.aimOffset or V0)
+                        local direction = point - origin
+                        if vec(direction) and direction.Magnitude > 1e-5 then
+                            local yaw, pitch = angles(direction.Unit)
+                            local aim = aimAt(f, yaw, pitch)
+                            local rating = rate(f, aim, false)
+                            owner.validationSequence = (owner.validationSequence or 0) + 1
+                            audit.checked[#audit.checked + 1] = { valid = rating ~= nil, directBestShot = true,
+                                score = rating and rating.score, defenderRisk = rating and rating.defenderRisk,
+                                gap = rating and rating.gap, flightSeconds = rating and rating.eta, targetSide = bestShotSide }
+                            if rating and (not bestDirectRating or betterRating(rating, bestDirectRating)) then
+                                bestDirect, bestDirectRating = aim, rating
+                            end
+                        end
+                    end
+                end
+                if bestDirect and bestDirectRating then
+                    chosen, best, selectedCandidate, selectedCurve = bestDirect, bestDirectRating, nil, f.curve
+                end
+            end
+        end
+
         -- A valid current aim is also a candidate, including while alternatives are still solving.
         -- Retain it under the same scoped correction guard instead of giving it back to another aim helper.
-        local confirmed = normal and (requiredCurve == nil or f.curve == requiredCurve)
+        local confirmed = not owner.flickActive and normal and (requiredCurve == nil or f.curve == requiredCurve)
+            and (not bestShotReady or bestShotTargetAllowed(f, normal, bestShotSide))
             and not betterRating(best, normal)
         if confirmed then chosen, best, selectedCandidate, selectedCurve = table.clone(sample), normal, nil, f.curve end
+        -- If Flick Assist is active, never silently replace a valid opposite-side
+        -- solution with the user's original direction. Only fall back when the
+        -- requested side has no valid candidate at all.
+        if owner.flickActive and not chosen then
+            -- Cached candidates can all be stale or belong to the original lane.
+            -- Generate fresh opposite-side edge shots now, and validate each one.
+            -- This is deliberately bounded so the release path stays responsive.
+            local fallbackTargets = {
+                { inset = C.FlickEdgeInset, y = 0.72 },
+                { inset = C.FlickFallbackInset, y = 0.58 },
+                { inset = 0.68, y = 0.78 },
+                { inset = 0.78, y = 0.38 },
+            }
+            for _, targetSpec in ipairs(fallbackTargets) do
+                if not chosen then
+                    local aim = directFlickAim(f, flickSide, targetSpec.inset, targetSpec.y)
+                    if aim then
+                        local candidateFrame = f
+                        if f.autoCurve and requiredCurve ~= nil then
+                            candidateFrame = table.clone(f)
+                            candidateFrame.curve = requiredCurve
+                        end
+                        local rating = rate(candidateFrame, aim, false)
+                        owner.validationSequence = (owner.validationSequence or 0) + 1
+                        audit.checked[#audit.checked + 1] = { valid = rating ~= nil, directFlick = true,
+                            score = rating and rating.score, defenderRisk = rating and rating.defenderRisk,
+                            gap = rating and rating.gap, flightSeconds = rating and rating.eta }
+                        if rating then
+                            chosen, best, selectedCandidate, selectedCurve = aim, rating, nil, candidateFrame.curve
+                            owner.flickDirect = true
+                            break
+                        end
+                    end
+                end
+            end
+            if not chosen then
+                owner.flickFallback = true
+                if normal and (requiredCurve == nil or f.curve == requiredCurve) then
+                    chosen, best, selectedCandidate, selectedCurve = table.clone(sample), normal, nil, f.curve
+                end
+            else
+                owner.flickFallback = false
+            end
+        else
+            owner.flickFallback = false
+        end
+        -- If the cached search did not produce a far-side candidate, create a
+        -- small deterministic far-side set now. These are still passed through
+        -- rate(), so no blind target is applied.
+        if not chosen and not owner.flickActive and bestShotReady then
+            local inset = f.radius + C.EdgeMargin + C.TargetSlack
+            local half = f.mouth.halfWidth - inset
+            local low = f.mouth.bottom + f.radius + 0.4
+            local high = f.mouth.top - inset
+            if half > 0 and high > low then
+                local targets = { 0.72, 0.52, 0.32 }
+                for _, ratio in ipairs(targets) do
+                    if not chosen then
+                        local x = half * ratio * bestShotSide
+                        local y = low + (high - low) * ratio
+                        local point = targetPoint(f.mouth, Vector2.new(x, y))
+                        local origin = f.sample.Origin + (f.aimOffset or V0)
+                        local direction = point - origin
+                        if vec(direction) and direction.Magnitude > 1e-5 then
+                            local yaw, pitch = angles(direction.Unit)
+                            local aim = aimAt(f, yaw, pitch)
+                            local rating = rate(f, aim, false)
+                            if rating and bestShotTargetAllowed(f, rating, bestShotSide) then
+                                chosen, best, selectedCandidate, selectedCurve = aim, rating, nil, f.curve
+                            end
+                        end
+                    end
+                end
+            end
+        end
         if choice and not chosen then
             -- A commitment is not a cached collision verdict. If no checked route
             -- with this curve is valid now, allow the validated ordinary fallback.
             owner.curveChoice, choice = nil, nil
-            if normal then chosen, best, selectedCandidate, selectedCurve = table.clone(sample), normal, nil, f.curve end
+            if normal and (not bestShotReady or bestShotTargetAllowed(f, normal, bestShotSide)) then
+                chosen, best, selectedCandidate, selectedCurve = table.clone(sample), normal, nil, f.curve
+            end
         end
         owner.selectedCandidate = selectedCandidate
         owner.completedAlternatives = #owner.candidates
@@ -6756,24 +6959,6 @@ local function createStriker(d)
         end
         owner.bestGap = best.gap
         owner.selectedCurve = selectedCurve
-
-        -- Start moving the aim toward the far side at 60% charge and finish
-        -- the redirect at 72%. This keeps the early camera aim stable while
-        -- preventing a late snap.
-        local redirectAlpha = math.clamp(
-            (f.charge - C.BestShotRedirectStart)
-                / math.max(0.001, C.BestShotRedirectFull - C.BestShotRedirectStart),
-            0, 1
-        )
-        if redirectAlpha < 1 then
-            local blended = table.clone(chosen)
-            local direction = sample.Direction:Lerp(chosen.Direction, redirectAlpha)
-            if direction.Magnitude > 1e-5 then
-                blended.Direction = direction.Unit
-            end
-            chosen = blended
-        end
-
         if f.autoCurve and (choice or decideCurve) then
             owner.curveChoice = { curve = selectedCurve, frame = f,
                 candidate = { direction = chosen.Direction, frame = f, at = clock,
@@ -6783,14 +6968,30 @@ local function createStriker(d)
             owner.pair = { aim = chosen, direction = chosen.Direction, curve = selectedCurve,
                 manualCurve = f.curve, character = f.character, context = f.context, ballId = f.ballId }
         end
+        -- Blend from the user's original aim into the validated opposite-side
+        -- solution during the final charge window. The endpoint remains the
+        -- validated flick trajectory; smoothness only controls how quickly we turn.
+        if owner.flickActive and not owner.flickFallback and best and selectedCandidate
+            and candidateSide(f, selectedCandidate) == flickSide then
+            local alpha = math.clamp(owner.flickAlpha or 1, 0, 1)
+            if alpha < 0.999 then
+                local blended = table.clone(chosen)
+                local direction = sample.Direction:Lerp(chosen.Direction, alpha)
+                if direction.Magnitude > 1e-5 then blended.Direction = direction.Unit end
+                chosen = blended
+            end
+        end
         owner.applied, owner.rating, owner.direction = true, best, chosen.Direction
         owner.appliedAim = table.clone(chosen)
+        owner.flicked = owner.flickActive and not owner.flickFallback
+            and (owner.flickAlpha or 0) >= 0.999
+            and candidateSide(f, selectedCandidate) == flickSide
         owner.redirected = (chosen.Direction - sample.Direction).Magnitude > 1e-5 or math.abs(selectedCurve - f.curve) > 1e-5
-        owner.reason = owner.redirected and "assisted" or "confirmed_aim"
+        owner.reason = owner.flicked and "flick_assist" or (owner.redirected and "assisted" or "confirmed_aim")
         stats.lastCharge, stats.lastCurve = f.charge, selectedCurve
-        setStatus(best.defenderRisk == 2 and "DEFENDER IN SHOT PATH"
+        setStatus(owner.flicked and "FLICK ASSIST" or (best.defenderRisk == 2 and "DEFENDER IN SHOT PATH"
             or (best.defenderRisk == 1 and "DEFENDERS COVER SHOT")
-            or (not owner.redirected and "AIM CONFIRMED" or (best.gap >= C.ClearGapThreshold and "OUTSIDE MODELED REACH" or "BEST AVAILABLE SHOT")),
+            or (not owner.redirected and "AIM CONFIRMED" or (best.gap >= C.ClearGapThreshold and "OUTSIDE MODELED REACH" or "BEST AVAILABLE SHOT"))),
             decisionDetail(owner))
         local scope = scopes[thread()]
         if scope then scope.applied = true end
@@ -6868,21 +7069,14 @@ local function createStriker(d)
         if not inBudget() or not now then return nil end
         local remaining = f.maximumCharge - f.elapsed
         local laterBest
-        local function worthReleasing(later)
-            return not later
-                or ((now.defenderRisk or 0) ~= (later.defenderRisk or 0) and betterRating(now, later))
-                or ((now.defenderRisk or 0) == (later.defenderRisk or 0) and now.score >= later.score + C.ReleaseMargin)
-        end
         for _, delay in ipairs({ remaining / 2, remaining }) do
             local later, valid = evaluate(delay)
             if not inBudget() or not valid then return nil end
             if betterRating(later, laterBest) then laterBest = later end
-            -- One better future option is enough to keep holding. Only an early
-            -- release requires all comparisons; avoid an unnecessary full-power
-            -- simulation when the halfway option already rules release out.
-            if not worthReleasing(laterBest) then break end
         end
-        local release = worthReleasing(laterBest)
+        local release = not laterBest
+            or ((now.defenderRisk or 0) ~= (laterBest.defenderRisk or 0) and betterRating(now, laterBest))
+            or ((now.defenderRisk or 0) == (laterBest.defenderRisk or 0) and now.score >= laterBest.score + C.ReleaseMargin)
         owner.releaseTiming = { decision = release and "release" or "wait", charge = f.charge,
             nowScore = now.score, laterScore = laterBest and laterBest.score or nil,
             nowDefenderRisk = now.defenderRisk, laterDefenderRisk = laterBest and laterBest.defenderRisk or nil }
@@ -7126,11 +7320,14 @@ local function createStriker(d)
                 if session.smartDispatched then stats.autoReleases += 1 end
                 if session.applied then stats.assisted += 1 end
                 if session.applied and session.redirected then stats.redirected += 1 end
+                if session.flicked then stats.flicks += 1 end
                 if session.applied and not session.redirected then stats.confirmed += 1 end
                 stats.lastCharge, stats.lastCurve = command.ChargeSeconds or 0, command.Curve or 0
                 table.insert(recentShots, { charge = stats.lastCharge, curve = stats.lastCurve,
                     assisted = session.applied == true, aimLocked = session.locked == true,
                     redirected = session.applied == true and session.redirected == true,
+                    flicked = session.flicked == true,
+                    flickSide = session.flickSide,
                     decision = session.reason or "native", bestCandidateGap = session.bestGap,
                     completedAlternatives = session.completedAlternatives or 0,
                     checkedAlternatives = session.checkedAlternatives or 0,
@@ -7239,20 +7436,28 @@ local function createStriker(d)
         end
         return true
     end
+    function A.SetFlickSmoothness(value)
+        if not alive or installing then return false end
+        A.FlickSmoothness = math.clamp(math.floor(tonumber(value) or 6), 1, 10)
+        return true
+    end
+    function A.SetFlickAssist(value)
+        if not alive or installing then return false end
+        if value and not A.Enabled and not A.SetEnabled(true) then return false end
+        A.FlickAssist = value == true
+        if session and not session.locked then
+            session.flicked, session.flickActive, session.flickSide, session.flickFallback = false, false, 0, false
+            session.job = nil
+            table.clear(session.candidates)
+        end
+        return true
+    end
     function A.SetSmartRelease(value)
         if not alive or installing then return false end
         if value and not A.Enabled and not A.SetEnabled(true) then return false end
         A.SmartRelease = value == true
         -- Enabling applies to the next user press. Disabling stops an active check.
         if session and not A.SmartRelease then session.smartRelease = false end
-        return true
-    end
-    function A.GetAssistRange()
-        return C.MaxAssistDistance
-    end
-    function A.SetAssistRange(value)
-        if not alive or not num(value) then return false end
-        C.MaxAssistDistance = math.clamp(math.floor(value + 0.5), 40, 100)
         return true
     end
     function A.Cleanup()
@@ -7264,9 +7469,9 @@ local function createStriker(d)
         return restore()
     end
     function A.Debug()
-        return { enabled = A.Enabled, autoCurve = A.AutoCurve, smartRelease = A.SmartRelease, ready = A.Ready, status = A.Status, detail = A.Detail,
+        return { enabled = A.Enabled, autoCurve = A.AutoCurve, smartRelease = A.SmartRelease, flickAssist = A.FlickAssist, flickSmoothness = A.FlickSmoothness, ready = A.Ready, status = A.Status, detail = A.Detail,
             lastError = A.LastError, stats = table.clone(stats), active = session ~= nil,
-            locked = session and session.locked or false, recentShots = table.clone(recentShots), prototype = "STR 0.16.3",
+            locked = session and session.locked or false, recentShots = table.clone(recentShots), prototype = "STR 0.16",
             defenderAwareness = true,
             releaseTiming = session and session.releaseTiming or nil,
             maxAssistDistance = C.MaxAssistDistance, clearGapThreshold = C.ClearGapThreshold }
@@ -7276,7 +7481,7 @@ local function createStriker(d)
         betterRating = betterRating,
         solve = solve, frame = frame, scopeCall = scopeCall, choose = choose, native = N,
         compatible = compatible, launch = launch, rate = rate, stats = stats, keepersFor = keepersFor, candidateAim = candidateAim,
-        horizontalReach = horizontalReach, searchTargets = searchTargets, shotZone = shotZone, insetAim = insetAim,
+        horizontalReach = horizontalReach, searchTargets = searchTargets, shotZone = shotZone, flickAimSide = flickAimSide, keeperBias = keeperBias, flickTargetSide = flickTargetSide, candidateSide = candidateSide,
         setSession = function(value) session = value end, getSession = function() return session end } end
     return A
 end
