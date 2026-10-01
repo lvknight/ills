@@ -348,7 +348,7 @@ local function showDmcUpdatePrompt(parent, hex)
     local heading = Instance.new("TextLabel")
     heading.Position, heading.Size = UDim2.fromOffset(14, 8), UDim2.new(1, -28, 0, 28)
     heading.BackgroundTransparency, heading.TextSize, heading.Font = 1, 18, Enum.Font.FredokaOne
-    heading.TextXAlignment, heading.TextColor3, heading.Text, heading.Parent = Enum.TextXAlignment.Left, accent, "Banyu | Script updated", panel
+    heading.TextXAlignment, heading.TextColor3, heading.Text, heading.Parent = Enum.TextXAlignment.Left, accent, "Dmc | Script updated", panel
     local message = Instance.new("TextLabel")
     message.Position, message.Size = UDim2.fromOffset(14, 52), UDim2.new(1, -28, 0, 56)
     message.BackgroundTransparency, message.TextWrapped, message.TextSize = 1, true, 16
@@ -382,7 +382,7 @@ local function createDmcStartup(d)
     }
     function B.Status(text)
         B.stage = text
-        if not B.finished then pcall(d.show, "Banyu | Starting", text) end
+        if not B.finished then pcall(d.show, "Dmc | Starting", text) end
     end
     function B.Load(path)
         B.Status("Loading " .. path)
@@ -415,7 +415,7 @@ local function createDmcStartup(d)
             end
             B.error = message
             d.warn("[Dmc startup] " .. message)
-            pcall(d.show, "Banyu | Startup failed", message .. "\n\nSend this error and your executor name when reporting the problem.")
+            pcall(d.show, "Dmc | Startup failed", message .. "\n\nSend this error and your executor name when reporting the problem.")
         end
         return ok, err
     end
@@ -475,19 +475,19 @@ local BOOT = createDmcStartup({
         local players = game:GetService("Players")
         local deadline = os.clock() + 30
         while (not game:IsLoaded() or not players.LocalPlayer) and os.clock() < deadline do
-            startupShow("Banyu | Starting", "Waiting for the game to finish loading...")
+            startupShow("Dmc | Starting", "Waiting for the game to finish loading...")
             task.wait(0.1)
         end
-        assert(game:IsLoaded() and players.LocalPlayer, "Game client was not ready after 30 seconds. Join the game before running Banyu.")
+        assert(game:IsLoaded() and players.LocalPlayer, "Game client was not ready after 30 seconds. Join the game before running Dmc.")
         assert(players.LocalPlayer:WaitForChild("PlayerGui", 30), "PlayerGui is unavailable.")
-        startupShow("Banyu | Starting", "Loading game modules...")
+        startupShow("Dmc | Starting", "Loading game modules...")
     end,
     resolve = function(path)
         local object = game:GetService("ReplicatedStorage")
         local deadline = os.clock() + 30
         for name in string.gmatch(path, "[^.]+") do
             object = object:WaitForChild(name, math.max(0.01, deadline - os.clock()))
-            assert(object, "Missing dependency: " .. path .. ". Run Banyu in the supported game after it loads.")
+            assert(object, "Missing dependency: " .. path .. ". Run Dmc in the supported game after it loads.")
         end
         return object
     end,
@@ -9045,7 +9045,7 @@ do
     local header = frame(panel, "DragHandle", 12, 0, 224, 40)
     header.BackgroundTransparency = 1
     header.Active = true
-    text(header, "Banyu", 13, {
+    text(header, "Dmc", 13, {
         Name = "PageTitle", Size = UDim2.fromScale(1, 1),
         Font = Enum.Font.FredokaOne,
     })
@@ -10559,7 +10559,7 @@ ENV.AutoGKDebug = function()
 end
 
 SettingsStore.Acknowledge()
-print("[Banyu] Loaded | " .. RELEASE_VERSION .. " | RightShift: show / hide")
+print("[Dmc] Loaded | " .. RELEASE_VERSION .. " | RightShift: show / hide")
 
 -- DMC MAIN END
 end)
