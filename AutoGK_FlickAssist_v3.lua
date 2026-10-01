@@ -6002,10 +6002,14 @@ local function createStriker(d)
         -- Prepare far-side candidates before the actual redirect window.
         -- This prevents the 60% switch from happening before the validated
         -- far-side route has finished solving.
+        -- Best Shot timing is percentage-based, not raw seconds.
+        -- This keeps 45%/60% consistent across different native charge lengths.
         local bestShotPrepareCharge = math.clamp(C.BestShotPrepareCharge or 0.45, 0, 0.90)
         local bestShotSwitchCharge = math.clamp(C.BestShotSwitchCharge or 0.60, 0, 0.95)
-        local bestShotPreparing = (f.charge or 0) >= bestShotPrepareCharge
-        local bestShotReady = (f.charge or 0) >= bestShotSwitchCharge
+        local maximumCharge = math.max(f.maximumCharge or 0, 1e-4)
+        local bestShotProgress = math.clamp((f.charge or 0) / maximumCharge, 0, 1)
+        local bestShotPreparing = bestShotProgress >= bestShotPrepareCharge
+        local bestShotReady = bestShotProgress >= bestShotSwitchCharge
         owner.bestShotPreparing = bestShotPreparing
         owner.bestShotReady = bestShotReady
         -- Before 60%, never disturb the player's original aim. At/after 60%,
@@ -6189,16 +6193,26 @@ local function createStriker(d)
         -- Once the redirect window is reached, validate a small deterministic
         -- far-side set immediately. This is independent of the background solver,
         -- so a slow/stale candidate queue cannot make Best Shot appear inactive.
-        if not chosen and not owner.flickActive and bestShotReady then
+        if not chosen and not owner.flickActive and bestShotReady and bestShotSide ~= 0 then
             local inset = f.radius + C.EdgeMargin + C.TargetSlack
             local half = f.mouth.halfWidth - inset
             local low = f.mouth.bottom + f.radius + 0.4
             local high = f.mouth.top - inset
             if half > 0 and high > low then
-                local y = low + (high - low) * 0.56
-                for _, ratio in ipairs({0.86, 0.68, 0.50}) do
-                    if not chosen then
-                        local point = targetPoint(f.mouth, Vector2.new(half * ratio * bestShotSide, y))
+                -- Try several heights on the far side. The target itself is checked
+                -- against the keeper before rate(); rate() then only decides whether
+                -- the actual shot physics can reach that target.
+                local bestDirect, bestDirectRating
+                for _, spec in ipairs({
+                    { x = 0.90, y = 0.70 },
+                    { x = 0.78, y = 0.52 },
+                    { x = 0.64, y = 0.35 },
+                    { x = 0.92, y = 0.88 },
+                }) do
+                    local point = targetPoint(f.mouth, Vector2.new(half * spec.x * bestShotSide, low + (high - low) * spec.y))
+                    local pointSide = (point - f.mouth.center):Dot(f.mouth.lateral)
+                    local targetAllowed = pointSide * bestShotSide >= f.mouth.halfWidth * 0.34
+                    if targetAllowed then
                         local origin = f.sample.Origin + (f.aimOffset or V0)
                         local direction = point - origin
                         if vec(direction) and direction.Magnitude > 1e-5 then
@@ -6208,12 +6222,15 @@ local function createStriker(d)
                             owner.validationSequence = (owner.validationSequence or 0) + 1
                             audit.checked[#audit.checked + 1] = { valid = rating ~= nil, directBestShot = true,
                                 score = rating and rating.score, defenderRisk = rating and rating.defenderRisk,
-                                gap = rating and rating.gap, flightSeconds = rating and rating.eta }
-                            if rating and bestShotTargetAllowed(f, rating, bestShotSide) then
-                                chosen, best, selectedCandidate, selectedCurve = aim, rating, nil, f.curve
+                                gap = rating and rating.gap, flightSeconds = rating and rating.eta, targetSide = bestShotSide }
+                            if rating and (not bestDirectRating or betterRating(rating, bestDirectRating)) then
+                                bestDirect, bestDirectRating = aim, rating
                             end
                         end
                     end
+                end
+                if bestDirect and bestDirectRating then
+                    chosen, best, selectedCandidate, selectedCurve = bestDirect, bestDirectRating, nil, f.curve
                 end
             end
         end
