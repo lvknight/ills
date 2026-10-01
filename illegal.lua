@@ -7460,6 +7460,17 @@ local function createStriker(d)
         if session and not A.SmartRelease then session.smartRelease = false end
         return true
     end
+    -- Compatibility API used by the surrounding Dmc UI/config layer.
+    -- This does not alter the v18 Best Shot engine; it only exposes the
+    -- assist-distance setting that the host UI expects.
+    function A.GetAssistRange()
+        return C.MaxAssistDistance
+    end
+    function A.SetAssistRange(value)
+        if not alive or not num(value) then return false end
+        C.MaxAssistDistance = math.clamp(math.floor(value + 0.5), 40, 100)
+        return true
+    end
     function A.Cleanup()
         if not cancelPairedCharge() then return false end
         alive, A.Enabled = false, false
