@@ -4707,7 +4707,7 @@ local function createStriker(d)
         ReleaseInterval = 0.05, ReleaseMargin = 0.35, ReleaseBudgetMs = 2.5,
         FlickTriggerCharge = 0.80, FlickCenterThreshold = 0.22, FlickKeeperDeadzone = 0.70,
         FlickMaxChecks = 5, FlickEdgeInset = 0.94, FlickFallbackInset = 0.82,
-        BestShotMaxChecks = 12, BestShotSwitchCharge = 0.60 }
+        BestShotMaxChecks = 12, BestShotPrepareCharge = 0.45, BestShotSwitchCharge = 0.60 }
     local stats = { shots = 0, assisted = 0, redirected = 0, flicks = 0, confirmed = 0, rejected = 0, candidates = 0, evaluations = 0,
         errors = 0, maxSliceMs = 0, maxAimMs = 0, lastCharge = 0, lastCurve = 0,
         releaseChecks = 0, releaseBudgetSkips = 0, releaseRequests = 0, autoReleases = 0, maxReleaseMs = 0 }
@@ -5999,9 +5999,17 @@ local function createStriker(d)
         owner.flickActive = A.FlickAssist and flickSide ~= 0 and flickAlpha > 0
         local bestShotSide = preferredShotSide(f)
         owner.bestShotSide = bestShotSide
+        -- Prepare far-side candidates before the actual redirect window.
+        -- This prevents the 60% switch from happening before the validated
+        -- far-side route has finished solving.
+        local bestShotPrepareCharge = math.clamp(C.BestShotPrepareCharge or 0.45, 0, 0.90)
         local bestShotSwitchCharge = math.clamp(C.BestShotSwitchCharge or 0.60, 0, 0.95)
+        local bestShotPreparing = (f.charge or 0) >= bestShotPrepareCharge
         local bestShotReady = (f.charge or 0) >= bestShotSwitchCharge
+        owner.bestShotPreparing = bestShotPreparing
         owner.bestShotReady = bestShotReady
+        -- Before 60%, never disturb the player's original aim. At/after 60%,
+        -- only replace it after a far-side candidate has been freshly validated.
         if normal and not owner.flickActive and bestShotReady
             and not bestShotTargetAllowed(f, normal, bestShotSide) then
             normal = nil
@@ -6178,6 +6186,38 @@ local function createStriker(d)
                 if checked >= maxChecks then break end
             end
         end
+        -- Once the redirect window is reached, validate a small deterministic
+        -- far-side set immediately. This is independent of the background solver,
+        -- so a slow/stale candidate queue cannot make Best Shot appear inactive.
+        if not chosen and not owner.flickActive and bestShotReady then
+            local inset = f.radius + C.EdgeMargin + C.TargetSlack
+            local half = f.mouth.halfWidth - inset
+            local low = f.mouth.bottom + f.radius + 0.4
+            local high = f.mouth.top - inset
+            if half > 0 and high > low then
+                local y = low + (high - low) * 0.56
+                for _, ratio in ipairs({0.86, 0.68, 0.50}) do
+                    if not chosen then
+                        local point = targetPoint(f.mouth, Vector2.new(half * ratio * bestShotSide, y))
+                        local origin = f.sample.Origin + (f.aimOffset or V0)
+                        local direction = point - origin
+                        if vec(direction) and direction.Magnitude > 1e-5 then
+                            local yaw, pitch = angles(direction.Unit)
+                            local aim = aimAt(f, yaw, pitch)
+                            local rating = rate(f, aim, false)
+                            owner.validationSequence = (owner.validationSequence or 0) + 1
+                            audit.checked[#audit.checked + 1] = { valid = rating ~= nil, directBestShot = true,
+                                score = rating and rating.score, defenderRisk = rating and rating.defenderRisk,
+                                gap = rating and rating.gap, flightSeconds = rating and rating.eta }
+                            if rating and bestShotTargetAllowed(f, rating, bestShotSide) then
+                                chosen, best, selectedCandidate, selectedCurve = aim, rating, nil, f.curve
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
         -- A valid current aim is also a candidate, including while alternatives are still solving.
         -- Retain it under the same scoped correction guard instead of giving it back to another aim helper.
         local confirmed = not owner.flickActive and normal and (requiredCurve == nil or f.curve == requiredCurve)
