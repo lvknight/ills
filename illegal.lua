@@ -160,7 +160,7 @@ local function createDmcConfigStore(d)
         local range = value.striker.Range
         if type(range) ~= "number" or range ~= range or range < 40 or range > 100 then return nil end
         striker.Range = math.floor(range + 0.5)
-        for _, key in ipairs({ "AutoDribble", "InfiniteStamina" }) do
+        for _, key in ipairs({ "AutoDribble" }) do
             if type(value.misc[key]) ~= "boolean" then return nil end
             misc[key] = value.misc[key]
         end
@@ -293,7 +293,7 @@ local function createDmcSettingsController(d)
         return { goalkeeper = gk,
             striker = { Enabled = d.striker.Enabled, AutoCurve = d.striker.AutoCurve,
                 SmartRelease = d.striker.SmartRelease, Range = d.striker.GetAssistRange() },
-            misc = { AutoDribble = d.misc.AutoDribble, InfiniteStamina = d.misc.InfiniteStamina },
+            misc = { AutoDribble = d.misc.AutoDribble },
             accent = d.accent(), rainbowUI = d.rainbow and d.rainbow() == true or false }
     end
     local function apply(profile)
@@ -307,7 +307,6 @@ local function createDmcSettingsController(d)
         feature(d.striker, "Enabled", profile.striker.Enabled)
         assert(d.striker.SetAssistRange(profile.striker.Range) ~= false, "Shot range could not be changed")
         feature(d.misc, "AutoDribble", profile.misc.AutoDribble)
-        feature(d.misc, "InfiniteStamina", profile.misc.InfiniteStamina)
         for key, value in pairs(profile.goalkeeper) do if key ~= "Enabled" then d.config[key] = value end end
         d.resetGoalkeeper()
         if d.gkEnabled() ~= profile.goalkeeper.Enabled then d.setGK(profile.goalkeeper.Enabled) end
@@ -504,7 +503,7 @@ local Config = {
     UISampleHz = 4,
     SampleStep = 0.01,
     PredictionHorizon = 1.10,
-    GoalMarginSeconds = 0.045,
+    GoalMarginSeconds = 0.020,
     JumpQueueEstimate = 0.05,
     JumpQueueTimeout = 0.45,
     JumpDiveMinimumAge = 0.07,
@@ -543,10 +542,11 @@ local FeatureKeybinds = {
     ManualMovementFirst = "",
     BestShotAssist = "",
     FlickAssist = "",
+    BestShotFakeV1 = "",
+    BestShotFakeV2 = "",
     AutoCurve = "",
     SmartRelease = "",
     AutoDribble = "",
-    InfiniteStamina = "",
 }
 
 local Stats = {
@@ -4970,7 +4970,7 @@ end)
 
 -- STR: native aim input, bounded search, keeper and defender reach estimates.
 local function createStriker(d)
-    local A = { Enabled = false, AutoCurve = false, SmartRelease = false, FlickAssist = false, FlickSmoothness = 6, Ready = false, Status = "OFF", Detail = "", LastError = nil }
+    local A = { Enabled = false, AutoCurve = false, SmartRelease = false, FlickAssist = false, FlickSmoothness = 6, Ready = false, Status = "OFF", Detail = "", LastError = nil, FakeV1Active = false, FakeV2Active = false }
     local C = { SliceMs = 2.5, CallsPerSlice = 4, Horizon = 2.2, Step = 0.035,
         SampleHz = 30, CandidateAge = 0.35, NetworkMargin = 0.10, EdgeMargin = 0.65, TargetSlack = 0.35,
         MaxAssistDistance = 55, ClearGapThreshold = 0.75, VolleyPrepareSeconds = 0.30,
@@ -6753,6 +6753,25 @@ local function createStriker(d)
         stats.releaseRequests += 1
         N.Client.HandleInputEnded(owner.input)
     end
+    local function fakeShotStep()
+        local owner = session
+        if not (alive and A.Enabled and owner and N.Client.IsCharging()) then return end
+        if not (A.FakeV1Active or A.FakeV2Active) or owner.fakeExecuted then return end
+        local fill = N.Effects.GetObservedChargeFill(d.Player.UserId)
+        if not num(fill) or fill < 0 or fill > 1 then return end
+        if A.FakeV1Active and fill >= 0.65 and fill < 0.90 then
+            owner.fakeExecuted = true
+            A.FakeV1Active = false
+            local dribbleInput = N.Controls.CreateInput("Dribble")
+            if dribbleInput then
+                pcall(d.M.Dodge.HandleInputBegan, dribbleInput, false)
+            end
+        elseif A.FakeV2Active and fill >= 0.80 then
+            owner.fakeExecuted = true
+            owner.fakeV2Aim = true
+            A.FakeV2Active = false
+        end
+    end
     local function curveCommand(command)
         if not command or command.PassType ~= d.M.Actions.PassTypes.Shot then return command end
         local curve = pairedCurve(command.AimDirection)
@@ -6849,7 +6868,7 @@ local function createStriker(d)
             if not alive or not A.Enabled then return original(input, processed, transfer) end
             if not processed and N.Controls.IsInput("Kick", input) and not N.Client.IsCharging() then
                 session = { started = os.clock(), curve = 0, candidates = {}, locked = false, autoCurve = A.AutoCurve,
-                    input = input, smartRelease = A.SmartRelease,
+                    input = input, smartRelease = A.SmartRelease, fakeExecuted = false, fakeV2Aim = false,
                     volleyArrival = transfer and transfer.VolleyArrivalTime or nil }
             end
             local result = table.pack(scopeCall(original, input, processed, transfer))
@@ -6889,8 +6908,9 @@ local function createStriker(d)
                 -- Native aim updates are throttled. Only consider release after this
                 -- call reports its current ray/curve, not a previous update's sample.
                 if key == "UpdateAim" and owner and session == owner and owner.nativeAimRevision ~= revision
-                    and not scopes[thread()] and alive and A.Enabled and A.SmartRelease then
-                    guarded(smartReleaseStep)
+                    and not scopes[thread()] and alive and A.Enabled then
+                    if A.SmartRelease then guarded(smartReleaseStep) end
+                    if A.FakeV1Active or A.FakeV2Active then guarded(fakeShotStep) end
                 end
                 return table.unpack(result, 1, result.n)
             end end)
@@ -6908,6 +6928,16 @@ local function createStriker(d)
             local scope = scopes[thread()]
             scope.source = sample
             scope.applied = false
+            -- FakeV2: redirect aim upward at 75° elevation
+            if session and session.fakeV2Aim and typeof(sample) == "Ray" then
+                local origin = sample.Origin
+                local direction = sample.Direction.Unit
+                local horizontal = Vector3.new(direction.X, 0, direction.Z)
+                if horizontal.Magnitude > 1e-5 then
+                    local upward = CFrame.fromAxisAngle(horizontal:Cross(Vector3.new(0, 1, 0)).Unit, math.rad(75)) * horizontal.Unit
+                    sample = Ray.new(origin, upward * sample.Direction.Magnitude)
+                end
+            end
             local began = os.clock()
             local result = guarded(choose, sample) or sample
             stats.maxAimMs = math.max(stats.maxAimMs, (os.clock() - began) * 1000)
@@ -7111,6 +7141,22 @@ local function createStriker(d)
         if session and not A.SmartRelease then session.smartRelease = false end
         return true
     end
+    function A.SetFakeV1(value)
+        if not alive or installing then return false end
+        if value and not A.Enabled and not A.SetEnabled(true) then return false end
+        A.FakeV1Active = value == true
+        if A.FakeV1Active then A.FakeV2Active = false end
+        -- ponytail: holds charge, dribble-flicks at low charge, dribbles at high. Auto-disable after one use. No dodge module check yet.
+        return true
+    end
+    function A.SetFakeV2(value)
+        if not alive or installing then return false end
+        if value and not A.Enabled and not A.SetEnabled(true) then return false end
+        A.FakeV2Active = value == true
+        if A.FakeV2Active then A.FakeV1Active = false end
+        -- ponytail: 75° upward flick at ~80% charge. Auto-disable after one use. Needs aim override in solve/launch.
+        return true
+    end
     function A.GetAssistRange()
         return C.MaxAssistDistance
     end
@@ -7147,10 +7193,10 @@ end
 
 -- Optional STR extras. Native input/cooldowns and stamina source ownership stay intact.
 local function createStrikerMisc(d)
-    local A = { AutoDribble = false, InfiniteStamina = false, DribbleStatus = "OFF", StaminaStatus = "OFF" }
+    local A = { AutoDribble = false, DribbleStatus = "OFF" }
     local N: { [string]: any } = {}
-    local alive, loadingDribble, loadingStamina = true, false, false
-    local generation, staminaGeneration = 0, 0
+    local alive, loadingDribble = true, false, false
+    local generation = 0
     local heartbeat, inputConnection = nil, nil
     local controlConnection, pickupWindow = nil, nil
     local scanning, manualHadBall = false, true
@@ -7162,22 +7208,16 @@ local function createStrikerMisc(d)
     local ownershipHook, nativeOwner = nil, nil
     local queuedScan, requestScan = nil, nil
     local nextPingSample, networkLead = 0, 0
-    local guardHook = nil
-    local placementHook = nil
     local nextTick, nextDiscovery, manualUntil, retryAt = 0, 0, 0, 0
     local candidates, cachedCharacter = {}, nil
-    local staminaSource = "DmcStamina_" .. d.id
-    local staminaOwned = false
     local stats = { scans = 0, threats = 0, proximityTriggers = 0, tackleTriggers = 0, kickTriggers = 0,
         attempts = 0, started = 0, nativeBlocked = 0, localCorrections = 0,
-        staminaAutoOff = 0, positionRepairs = 0, staminaBudgetResets = 0,
         observerErrors = 0, errors = 0, maxTickMs = 0, readyTicks = 0, blockedTicks = 0,
         motionAligned = 0, kickStateWithoutPresentation = 0, earlyAttackSamples = 0,
         pickupReadinessWakes = 0, pickupInputResets = 0 }
     local recent = {}
     local blockedBy, recentGates = {}, {}
     local lastScan = nil
-    local lastCorrection = nil
     local C = { Interval = 1 / 60, DiscoverySeconds = 0.15, Range = 40, Lookahead = 0.22, KickLookahead = 0.12,
         RetrySeconds = 0.25, Step = 0.025, Padding = 1.0, ManualGrace = 0.15, MaximumDisplayLead = 0.20,
         ChargeStateGrace = 0.10, MaximumNetworkLead = 0.12, PingSampleSeconds = 0.5,
@@ -7220,102 +7260,6 @@ local function createStrikerMisc(d)
         nativeOwner = nil
         candidates, cachedCharacter = {}, nil
         nextDiscovery = 0
-    end
-    local function stopStaminaWatch()
-        if guardHook then
-            guardHook.active = false
-            -- A later wrapper belongs to its installer; leave our inner observer passive.
-            if N.Guard.Validate == guardHook.observer then N.Guard.Validate = guardHook.original end
-            guardHook = nil
-        end
-        if placementHook then
-            placementHook.active = false
-            if N.Placement.RepairPosition == placementHook.observer then
-                N.Placement.RepairPosition = placementHook.original
-            end
-            placementHook = nil
-        end
-    end
-    local function noteCorrection(correction)
-        lastCorrection = correction
-        -- Corrections are observations, not requests to change the user's switch.
-        -- The native guard/placement functions still apply their normal repairs.
-        A.StaminaStatus = "LOCAL ON"
-    end
-    local function startPlacementWatch()
-        local hook = { original = N.Placement.RepairPosition, active = true }
-        local function capture(character, root, target)
-            if not (hook.active and alive and d.alive() and A.InfiniteStamina)
-                or character ~= d.Player.Character or not root or not vector(target)
-                or d.M.Replay.IsActive() or d.M.Freeze.IsFrozen() then return nil end
-            return { position = root.Position, velocity = root.AssemblyLinearVelocity,
-                context = d.M.Motion.GetContext(character) }
-        end
-        local function observe(sample, target, result)
-            if not sample or result[2] ~= true then return end
-            local origin = vector(result[1]) and result[1] or sample.position
-            local delta = target - origin
-            local horizontal = flat(delta)
-            if horizontal.Magnitude <= 0.5 then return end
-            local velocity = flat(sample.velocity)
-            -- Ignore forward/lateral repairs while moving and vertical floor recovery.
-            -- The native placement API alone does not prove why the repair was issued.
-            if velocity.Magnitude >= 1 and horizontal:Dot(velocity.Unit) >= -0.5 then return end
-            stats.positionRepairs += 1
-            noteCorrection({ clock = os.clock(), context = sample.context, positionChange = delta.Magnitude,
-                horizontalChange = horizontal.Magnitude, source = "CharacterPlacement.RepairPosition",
-                staminaWasOn = true, serverConfirmed = false })
-        end
-        hook.observer = function(character, root, target, ...)
-            local captured, sample = pcall(capture, character, root, target)
-            if not captured then stats.observerErrors += 1; sample = nil end
-            -- Preserve the native repair, all return values, and native errors exactly.
-            local result = table.pack(hook.original(character, root, target, ...))
-            if sample then
-                local ok = pcall(observe, sample, target, result)
-                if not ok then stats.observerErrors += 1 end
-            end
-            return table.unpack(result, 1, result.n)
-        end
-        placementHook = hook
-        N.Placement.RepairPosition = hook.observer
-    end
-    local function startStaminaWatch()
-        assert(type(N.Guard.Validate) == "function", "Movement correction observer unavailable")
-        assert(type(N.Placement.RepairPosition) == "function", "Position repair observer unavailable")
-        if guardHook then
-            assert(guardHook.active, "Previous movement observer cleanup is incomplete")
-            return
-        end
-        local hook = { original = N.Guard.Validate, active = true }
-        local function noteRejected(root, claimedPosition, claimedVelocity)
-            stats.localCorrections += 1
-            local correction = { clock = os.clock(), context = d.M.Motion.GetContext(d.Player.Character),
-                positionChange = (root.Position - claimedPosition).Magnitude,
-                velocityChange = (root.AssemblyLinearVelocity - claimedVelocity).Magnitude,
-                source = "LocalMovementGuard.Validate", staminaWasOn = true }
-            noteCorrection(correction)
-        end
-        hook.observer = function(root, ...)
-            local character = d.Player.Character
-            local watching = hook.active and alive and d.alive() and A.InfiniteStamina
-                and root ~= nil and character and root == character:FindFirstChild("HumanoidRootPart")
-            local claimedPosition = watching and root.Position or nil
-            local claimedVelocity = watching and root.AssemblyLinearVelocity or nil
-            -- Run validation exactly once. Its corrections, result and errors stay native.
-            local result = hook.original(root, ...)
-            if watching and result == false then
-                local ok = pcall(noteRejected, root, claimedPosition, claimedVelocity)
-                if not ok then
-                    stats.observerErrors += 1
-                end
-            end
-            return result
-        end
-        guardHook = hook
-        N.Guard.Validate = hook.observer
-        startPlacementWatch()
-        -- No automatic shutoff, stamina drain, or correction retry loop.
     end
     local function stopDribbleWatch(err)
         A.AutoDribble = false
@@ -8040,66 +7984,17 @@ local function createStrikerMisc(d)
         if not connected then stopDribbleWatch(connectionError); return false end
         return true
     end
-    function A.SetInfiniteStamina(value)
-        value = value == true
-        staminaGeneration += 1
-        local request = staminaGeneration
-        if value and (not alive or not d.alive() or loadingStamina) then return false end
-        if value and A.InfiniteStamina then return true end
-        if not value and not staminaOwned then
-            local stopped, stopError = pcall(stopStaminaWatch)
-            A.InfiniteStamina = false
-            A.StaminaStatus = stopped and "OFF" or "CLEANUP REQUIRED"
-            if not stopped then problem(stopError) end
-            return stopped
-        end
-        loadingStamina = true
-        local ok, err = pcall(function()
-            if not N.Sprint then N.Sprint = d.load("Client.Gameplay.Player.Sprint") end
-            assert(type(N.Sprint.SetUnlimitedStamina) == "function", "Native stamina switch unavailable")
-            if value and not N.Guard then N.Guard = d.load("Modules.Characters.LocalMovementGuard") end
-            if value then
-                N.Placement = N.Placement or d.load("Modules.Characters.CharacterPlacement")
-            end
-            if value and (request ~= staminaGeneration or not alive or not d.alive()) then return end
-            if value then startStaminaWatch() end
-            -- Mark before calling: if native HUD refresh throws after setting the source,
-            -- rollback and later cleanup must still know that removal is required.
-            if value then staminaOwned = true end
-            N.Sprint.SetUnlimitedStamina(staminaSource, value)
-            staminaOwned = value
-            if not value then stopStaminaWatch() end
-        end)
-        loadingStamina = false
-        if not ok then
-            if value and staminaOwned then
-                local removed = pcall(N.Sprint.SetUnlimitedStamina, staminaSource, false)
-                if removed then staminaOwned = false end
-            end
-            if not staminaOwned then pcall(stopStaminaWatch) end
-            A.InfiniteStamina = staminaOwned
-            A.StaminaStatus = staminaOwned and "CLEANUP REQUIRED" or "ERROR"
-            problem(err)
-            return false
-        end
-        if value and (request ~= staminaGeneration or not alive or not d.alive()) then return false end
-        A.InfiniteStamina = value
-        A.StaminaStatus = value and "LOCAL ON" or "OFF"
-        return true
-    end
     function A.Cleanup()
         alive = false
         A.SetAutoDribble(false)
-        return A.SetInfiniteStamina(false)
+        return true
     end
     function A.Debug()
-        return { autoDribble = A.AutoDribble, infiniteStamina = A.InfiniteStamina,
-            dribbleStatus = A.DribbleStatus, staminaStatus = A.StaminaStatus,
-            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.17.6",
+        return { autoDribble = A.AutoDribble,
+            dribbleStatus = A.DribbleStatus,
+            lastError = A.LastError, version = "Misc 0.17.6",
             dribbleTrigger = "incoming_tackle_or_kick", tackleLookaheadSeconds = C.Lookahead,
             kickLookaheadSeconds = C.KickLookahead,
-            correctionFallback = false, positionRepairFallback = false, correctionPolicy = "observe_only",
-            lastCorrection = lastCorrection and table.clone(lastCorrection) or nil,
             inputMode = N.Input and type(N.Input.GetLastInputType) == "function" and N.Input.GetLastInputType() or nil,
             cooldownRemaining = N.Controls and type(N.Controls.GetCooldownRemaining) == "function"
                 and N.Controls.GetCooldownRemaining("Dribble") or nil,
@@ -9431,6 +9326,8 @@ local function buildDmcInterface() -- own function: Luau allows max 200 active l
     toggle("Best shot assist", function() return STR.Enabled end, STR.SetEnabled, "BestShot")
     toggle("Auto curve ball", function() return STR.AutoCurve end, STR.SetAutoCurve)
     toggle("Smart shot release", function() return STR.SmartRelease end, STR.SetSmartRelease)
+    toggle("Fake shot v1 (dribble)", function() return STR.FakeV1Active end, STR.SetFakeV1, "BestShotFakeV1")
+    toggle("Fake shot v2 (75° flick)", function() return STR.FakeV2Active end, STR.SetFakeV2, "BestShotFakeV2")
     do
         order += 1
         local row = frame(activeBody, "ShotRange", 0, 0, 292, 49, C.control)
@@ -9507,7 +9404,6 @@ local function buildDmcInterface() -- own function: Luau allows max 200 active l
     }, activeBody)
     order = 0
     toggle("Auto dribble", function() return MISC.AutoDribble end, MISC.SetAutoDribble)
-    toggle("Infinite stamina", function() return MISC.InfiniteStamina end, MISC.SetInfiniteStamina)
     local strikerStatus = text(strikerContent, "OFF", 11, {
         Name = "StrikerStatus", Position = UDim2.fromOffset(8, 327),
         Size = UDim2.fromOffset(276, 30), TextWrapped = true,
@@ -10126,7 +10022,7 @@ local function buildDmcInterface() -- own function: Luau allows max 200 active l
         if activeTab == "STR" then
             for i = gkRefresherCount + 1, #refreshers do refreshers[i]() end
             writeChanged(strikerStatus, "Text", STR.Status)
-            writeChanged(miscellaneousStatus, "Text", "Dribble: " .. MISC.DribbleStatus .. " | Stamina: " .. MISC.StaminaStatus)
+            writeChanged(miscellaneousStatus, "Text", "Dribble: " .. MISC.DribbleStatus)
             return
         end
         for i = 1, gkRefresherCount do refreshers[i]() end
