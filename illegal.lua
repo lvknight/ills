@@ -503,7 +503,8 @@ local Config = {
     UISampleHz = 4,
     SampleStep = 0.01,
     PredictionHorizon = 1.10,
-    GoalMarginSeconds = 0.020,
+    GoalMarginSeconds = 0.045,
+    NaturalPostMarginStuds = 1.45, -- Toleransi tiang / pinggir gawang agar tetap dive natural
     JumpQueueEstimate = 0.05,
     JumpQueueTimeout = 0.45,
     JumpDiveMinimumAge = 0.07,
@@ -542,8 +543,6 @@ local FeatureKeybinds = {
     ManualMovementFirst = "",
     BestShotAssist = "",
     FlickAssist = "",
-    BestShotFakeV1 = "",
-    BestShotFakeV2 = "",
     AutoCurve = "",
     SmartRelease = "",
     AutoDribble = "",
@@ -1345,6 +1344,75 @@ local function goalHalfWidth(context)
     ) * 0.5)
 end
 
+-- Native GetGoalCrossing ignores shots that clip the post or miss by a hair.
+-- Only shot detection uses the widened mouth; positioning keeps goalHalfWidth.
+local function getExtendedGoalCrossing(current, world, context, timestamp, maxHorizon)
+    local margin = math.clamp(finite(Config.NaturalPostMarginStuds) and Config.NaturalPostMarginStuds or 1.45, 0, 4)
+    if margin <= 0 then return nil, nil end
+
+    local goal = context.goal
+    local forward, right = context.forward, context.right
+    if current.Velocity:Dot(forward) >= 0 then return nil, nil end
+    if type(M.Physics.GetStateAtTime) ~= "function"
+        or type(M.Physics.GetAirFlight) ~= "function" then return nil, nil end
+
+    local frame, size = goal.CFrame, goal.Size
+    local halfDepth = (
+        math.abs(frame.RightVector:Dot(forward)) * size.X
+        + math.abs(frame.UpVector:Dot(forward)) * size.Y
+        + math.abs(frame.LookVector:Dot(forward)) * size.Z
+    ) * 0.5
+    local frontPlane = goal.Position + forward * halfDepth
+
+    local extendedHalfWidth = goalHalfWidth(context) + margin
+    local bottomY = goal.Position.Y - size.Y * 0.5 - 0.35
+    local extendedTopY = goal.Position.Y + size.Y * 0.5 + margin
+
+    local prevPos = current.Position
+    local prevDist = (prevPos - frontPlane):Dot(forward)
+    if prevDist <= 0 then return nil, nil end
+
+    local maxTime = math.min(finite(maxHorizon) and maxHorizon or 1.5, Config.PredictionHorizon + 0.20)
+    local step = 0.025
+    local stateA, stateB = {}, {}
+    local simState = current
+    local spin = current.Spin or Vector3.zero
+
+    for t = step, maxTime, step do
+        local out = simState == stateA and stateB or stateA
+        simState = M.Physics.GetStateAtTime(simState, timestamp + t, world, out)
+
+        local nextPos = (simState and finiteVector(simState.Position)) and simState.Position
+            or M.Physics.GetAirFlight(current.Position, current.Velocity, spin, t)
+        if not finiteVector(nextPos) then break end
+
+        local nextDist = (nextPos - frontPlane):Dot(forward)
+        -- Post rebound: judge the shot by its unobstructed flight instead.
+        if nextDist > 0 and simState and simState.BoundaryHits and #simState.BoundaryHits > 0 then
+            local airPos = M.Physics.GetAirFlight(current.Position, current.Velocity, spin, t)
+            if finiteVector(airPos) and (airPos - frontPlane):Dot(forward) <= 0 then
+                nextPos = airPos
+                nextDist = (airPos - frontPlane):Dot(forward)
+            end
+        end
+
+        if nextDist <= 0 then
+            local alpha = math.clamp(prevDist / math.max(prevDist - nextDist, 1e-6), 0, 1)
+            local crossPos = prevPos:Lerp(nextPos, alpha)
+            local crossTime = timestamp + (t - step) + step * alpha
+            local lateral = math.abs((crossPos - frontPlane):Dot(right))
+            if lateral <= extendedHalfWidth and crossPos.Y >= bottomY and crossPos.Y <= extendedTopY then
+                return crossPos, crossTime
+            end
+            break
+        end
+
+        prevPos, prevDist = nextPos, nextDist
+    end
+
+    return nil, nil
+end
+
 --==============================================================
 -- BALL SNAPSHOT
 --==============================================================
@@ -1566,6 +1634,16 @@ local function snapshot(character, root, humanoid)
             timestamp,
             M.Prediction.Constants.GoalCrossingMaximumPredictionSeconds
         )
+
+        if not position then
+            position, crossingTime = getExtendedGoalCrossing(
+                current,
+                world,
+                context,
+                timestamp,
+                M.Prediction.Constants.GoalCrossingMaximumPredictionSeconds
+            )
+        end
     end
 
     if position ~= nil
@@ -4970,14 +5048,16 @@ end)
 
 -- STR: native aim input, bounded search, keeper and defender reach estimates.
 local function createStriker(d)
-    local A = { Enabled = false, AutoCurve = false, SmartRelease = false, FlickAssist = false, FlickSmoothness = 6, Ready = false, Status = "OFF", Detail = "", LastError = nil, FakeV1Active = false, FakeV2Active = false }
+    local A = { Enabled = false, AutoCurve = false, SmartRelease = false, FlickAssist = false, FlickSmoothness = 6,
+        FakeShotV1 = false, FakeShotV2 = false, Ready = false, Status = "OFF", Detail = "", LastError = nil }
     local C = { SliceMs = 2.5, CallsPerSlice = 4, Horizon = 2.2, Step = 0.035,
         SampleHz = 30, CandidateAge = 0.35, NetworkMargin = 0.10, EdgeMargin = 0.65, TargetSlack = 0.35,
         MaxAssistDistance = 55, ClearGapThreshold = 0.75, VolleyPrepareSeconds = 0.30,
         ReleaseInterval = 0.05, ReleaseMargin = 0.35, ReleaseBudgetMs = 2.5,
         FlickTriggerCharge = 0.80, FlickCenterThreshold = 0.22, FlickKeeperDeadzone = 0.70,
         FlickMaxChecks = 5, FlickEdgeInset = 0.94, FlickFallbackInset = 0.82,
-        BestShotMaxChecks = 12, BestShotPrepareCharge = 0.45, BestShotSwitchCharge = 0.60 }
+        BestShotMaxChecks = 12, BestShotPrepareCharge = 0.45, BestShotSwitchCharge = 0.60,
+        FakeV1FlickStart = 0.72, FakeV1DribbleCharge = 0.88, FakeV2PitchRadians = math.rad(75) }
     local stats = { shots = 0, assisted = 0, redirected = 0, flicks = 0, confirmed = 0, rejected = 0, candidates = 0, evaluations = 0,
         errors = 0, maxSliceMs = 0, maxAimMs = 0, lastCharge = 0, lastCurve = 0,
         releaseChecks = 0, releaseBudgetSkips = 0, releaseRequests = 0, autoReleases = 0, maxReleaseMs = 0 }
@@ -5899,19 +5979,20 @@ local function createStriker(d)
     -- Flick starts only when the native charge reaches 80%. Higher smoothness
     -- spreads the direction transition over a larger part of the final charge.
     local function flickBlendAlpha(f)
-        if not A.FlickAssist or not f or f.volley then return 0 end
+        if not (A.FlickAssist or A.FakeShotV1 or A.FakeShotV2) or not f or f.volley then return 0 end
         local maximum = math.max(f.maximumCharge or 0, 1e-4)
         local progress = math.clamp((f.elapsed or 0) / maximum, 0, 1)
-        if progress < C.FlickTriggerCharge then return 0 end
+        local trigger = A.FakeShotV1 and C.FakeV1FlickStart or C.FlickTriggerCharge
+        if progress < trigger then return 0 end
         local smoothness = math.clamp(math.floor(tonumber(A.FlickSmoothness) or 6), 1, 10)
         local window = 0.035 + (smoothness - 1) * 0.018
-        local t = math.clamp((progress - C.FlickTriggerCharge) / window, 0, 1)
+        local t = math.clamp((progress - trigger) / window, 0, 1)
         -- Smoothstep keeps the first movement gentle and finishes decisively.
         return t * t * (3 - 2 * t)
     end
 
     local function flickAimSide(f, sample)
-        if not A.FlickAssist or not f or not f.mouth or typeof(sample) ~= "table"
+        if not (A.FlickAssist or A.FakeShotV1) or not f or not f.mouth or typeof(sample) ~= "table"
             or not vec(sample.Origin) or not vec(sample.Direction) then return 0 end
         local origin = sample.Origin + (f.aimOffset or V0)
         local denominator = sample.Direction:Dot(f.mouth.forward)
@@ -6227,6 +6308,30 @@ local function createStriker(d)
         end
         return string.format("%s | %d GK tracked | Searching", distance, count)
     end
+    local function executeFakeV1Dribble(owner)
+        if not owner or owner.fakeV1Dispatched then return end
+        owner.fakeV1Dispatched = true
+        A.FakeShotV1 = false -- one use per toggle
+        task.defer(function()
+            if not alive or not d.alive() then return end
+            -- Native Dodge refuses while a charge is live; cancel and refresh first.
+            if N.Client and type(N.Client.IsCharging) == "function" and N.Client.IsCharging() then
+                pcall(N.Client.CancelCharge)
+            end
+            if d.M.Dodge and type(d.M.Dodge.UpdateControlState) == "function" then
+                pcall(d.M.Dodge.UpdateControlState)
+            end
+            if N.Controls and type(N.Controls.CreateInput) == "function"
+                and d.M.Dodge and type(d.M.Dodge.HandleInputBegan) == "function" then
+                local input = N.Controls.CreateInput("Dribble")
+                if input and N.Controls.IsInput("Dribble", input) then
+                    pcall(d.M.Dodge.HandleInputBegan, input, false)
+                end
+            end
+            setStatus("V1 FAKE DRIBBLE", "Fake shot -> Dribble | OFF")
+        end)
+    end
+
     local function choose(sample)
         local owner = session
         if not owner or owner.locked then return sample end
@@ -6261,12 +6366,45 @@ local function createStriker(d)
         local normal = rate(f, sample, false)
         owner.rawRating = normal
         local flickAlpha = flickBlendAlpha(f)
+
+        -- V2 fake: any hold length -> 75° upward flick on release -> auto OFF.
+        if A.FakeShotV2 and not f.volley then
+            owner.fakeV2Used = true
+            if flickAlpha > 0 or owner.releasing then
+                local alpha = owner.releasing and 1 or flickAlpha
+                local yaw, basePitch = angles(sample.Direction)
+                local upwardAim = aimAt(f, yaw, basePitch + (C.FakeV2PitchRadians - basePitch) * alpha)
+                owner.applied = true
+                owner.rating = normal
+                owner.direction = upwardAim.Direction
+                owner.appliedAim = table.clone(upwardAim)
+                owner.flicked = alpha >= 0.999
+                owner.redirected = true
+                owner.reason = "v2_fake_75deg"
+                setStatus("V2 FAKE (75° UP)", "Flick 75° up | OFF on release")
+                local scope = scopes[thread()]
+                if scope then scope.applied = true end
+                return upwardAim
+            end
+            setStatus("V2 FAKE READY", "Hold shoot, release anytime for 75° flick")
+            return sample
+        end
+
+        -- V1 fake: side flick from 72%, cancel + dribble at 88% -> auto OFF.
+        if A.FakeShotV1 and not f.volley then
+            owner.fakeV1Used = true
+            if math.clamp((f.elapsed or 0) / math.max(f.maximumCharge or 0, 1e-4), 0, 1) >= C.FakeV1DribbleCharge then
+                executeFakeV1Dribble(owner)
+                return sample
+            end
+        end
+
         local flickSide = flickAlpha > 0
             and (previousFlickSide ~= 0 and previousFlickSide or flickTargetSide(f, sample))
             or 0
         owner.flickSide = flickSide
         owner.flickAlpha = flickAlpha
-        owner.flickActive = A.FlickAssist and flickSide ~= 0 and flickAlpha > 0
+        owner.flickActive = (A.FlickAssist or A.FakeShotV1) and flickSide ~= 0 and flickAlpha > 0
         local bestShotSide = preferredShotSide(f)
         owner.bestShotSide = bestShotSide
         -- Prepare far-side candidates before the actual redirect window.
@@ -6753,25 +6891,6 @@ local function createStriker(d)
         stats.releaseRequests += 1
         N.Client.HandleInputEnded(owner.input)
     end
-    local function fakeShotStep()
-        local owner = session
-        if not (alive and A.Enabled and owner and N.Client.IsCharging()) then return end
-        if not (A.FakeV1Active or A.FakeV2Active) or owner.fakeExecuted then return end
-        local fill = N.Effects.GetObservedChargeFill(d.Player.UserId)
-        if not num(fill) or fill < 0 or fill > 1 then return end
-        if A.FakeV1Active and fill >= 0.65 and fill < 0.90 then
-            owner.fakeExecuted = true
-            A.FakeV1Active = false
-            local dribbleInput = N.Controls.CreateInput("Dribble")
-            if dribbleInput then
-                pcall(d.M.Dodge.HandleInputBegan, dribbleInput, false)
-            end
-        elseif A.FakeV2Active and fill >= 0.80 then
-            owner.fakeExecuted = true
-            owner.fakeV2Aim = true
-            A.FakeV2Active = false
-        end
-    end
     local function curveCommand(command)
         if not command or command.PassType ~= d.M.Actions.PassTypes.Shot then return command end
         local curve = pairedCurve(command.AimDirection)
@@ -6868,7 +6987,7 @@ local function createStriker(d)
             if not alive or not A.Enabled then return original(input, processed, transfer) end
             if not processed and N.Controls.IsInput("Kick", input) and not N.Client.IsCharging() then
                 session = { started = os.clock(), curve = 0, candidates = {}, locked = false, autoCurve = A.AutoCurve,
-                    input = input, smartRelease = A.SmartRelease, fakeExecuted = false, fakeV2Aim = false,
+                    input = input, smartRelease = A.SmartRelease,
                     volleyArrival = transfer and transfer.VolleyArrivalTime or nil }
             end
             local result = table.pack(scopeCall(original, input, processed, transfer))
@@ -6908,9 +7027,8 @@ local function createStriker(d)
                 -- Native aim updates are throttled. Only consider release after this
                 -- call reports its current ray/curve, not a previous update's sample.
                 if key == "UpdateAim" and owner and session == owner and owner.nativeAimRevision ~= revision
-                    and not scopes[thread()] and alive and A.Enabled then
-                    if A.SmartRelease then guarded(smartReleaseStep) end
-                    if A.FakeV1Active or A.FakeV2Active then guarded(fakeShotStep) end
+                    and not scopes[thread()] and alive and A.Enabled and A.SmartRelease then
+                    guarded(smartReleaseStep)
                 end
                 return table.unpack(result, 1, result.n)
             end end)
@@ -6928,16 +7046,6 @@ local function createStriker(d)
             local scope = scopes[thread()]
             scope.source = sample
             scope.applied = false
-            -- FakeV2: redirect aim upward at 75° elevation
-            if session and session.fakeV2Aim and typeof(sample) == "Ray" then
-                local origin = sample.Origin
-                local direction = sample.Direction.Unit
-                local horizontal = Vector3.new(direction.X, 0, direction.Z)
-                if horizontal.Magnitude > 1e-5 then
-                    local upward = CFrame.fromAxisAngle(horizontal:Cross(Vector3.new(0, 1, 0)).Unit, math.rad(75)) * horizontal.Unit
-                    sample = Ray.new(origin, upward * sample.Direction.Magnitude)
-                end
-            end
             local began = os.clock()
             local result = guarded(choose, sample) or sample
             stats.maxAimMs = math.max(stats.maxAimMs, (os.clock() - began) * 1000)
@@ -7043,6 +7151,8 @@ local function createStriker(d)
                 local outcome = session.smartDispatched and "smart release | "
                     or (session.applied and (session.redirected and "assisted | " or "aim confirmed | ") or "normal | ")
                 setStatus("READY", "Last shot: " .. outcome .. decisionDetail(session))
+                -- Fake shots are one-use: any released shot turns both off.
+                A.FakeShotV1, A.FakeShotV2 = false, false
                 session.job = nil
                 session = nil
                 table.clear(nativeLaunches)
@@ -7133,28 +7243,34 @@ local function createStriker(d)
         end
         return true
     end
+    function A.SetFakeShotV1(value)
+        if not alive or installing then return false end
+        if value and not A.Enabled and not A.SetEnabled(true) then return false end
+        A.FakeShotV1 = value == true
+        if A.FakeShotV1 then A.FakeShotV2 = false end
+        if session and not session.locked then
+            session.job = nil
+            table.clear(session.candidates)
+        end
+        return true
+    end
+    function A.SetFakeShotV2(value)
+        if not alive or installing then return false end
+        if value and not A.Enabled and not A.SetEnabled(true) then return false end
+        A.FakeShotV2 = value == true
+        if A.FakeShotV2 then A.FakeShotV1 = false end
+        if session and not session.locked then
+            session.job = nil
+            table.clear(session.candidates)
+        end
+        return true
+    end
     function A.SetSmartRelease(value)
         if not alive or installing then return false end
         if value and not A.Enabled and not A.SetEnabled(true) then return false end
         A.SmartRelease = value == true
         -- Enabling applies to the next user press. Disabling stops an active check.
         if session and not A.SmartRelease then session.smartRelease = false end
-        return true
-    end
-    function A.SetFakeV1(value)
-        if not alive or installing then return false end
-        if value and not A.Enabled and not A.SetEnabled(true) then return false end
-        A.FakeV1Active = value == true
-        if A.FakeV1Active then A.FakeV2Active = false end
-        -- ponytail: holds charge, dribble-flicks at low charge, dribbles at high. Auto-disable after one use. No dodge module check yet.
-        return true
-    end
-    function A.SetFakeV2(value)
-        if not alive or installing then return false end
-        if value and not A.Enabled and not A.SetEnabled(true) then return false end
-        A.FakeV2Active = value == true
-        if A.FakeV2Active then A.FakeV1Active = false end
-        -- ponytail: 75° upward flick at ~80% charge. Auto-disable after one use. Needs aim override in solve/launch.
         return true
     end
     function A.GetAssistRange()
@@ -7984,15 +8100,21 @@ local function createStrikerMisc(d)
         if not connected then stopDribbleWatch(connectionError); return false end
         return true
     end
+    function A.SetInfiniteStamina(_value)
+        -- shortcut: legacy callers only, no stamina behavior; remove after external callers migrate.
+        A.InfiniteStamina = false
+        A.StaminaStatus = "REMOVED"
+        return true
+    end
     function A.Cleanup()
         alive = false
-        A.SetAutoDribble(false)
-        return true
+        return A.SetAutoDribble(false)
     end
     function A.Debug()
         return { autoDribble = A.AutoDribble,
+            infiniteStamina = false, staminaStatus = "REMOVED",
             dribbleStatus = A.DribbleStatus,
-            lastError = A.LastError, version = "Misc 0.17.6",
+            lastError = A.LastError, version = "Misc 0.18.0",
             dribbleTrigger = "incoming_tackle_or_kick", tackleLookaheadSeconds = C.Lookahead,
             kickLookaheadSeconds = C.KickLookahead,
             inputMode = N.Input and type(N.Input.GetLastInputType) == "function" and N.Input.GetLastInputType() or nil,
@@ -9311,23 +9433,23 @@ local function buildDmcInterface() -- own function: Luau allows max 200 active l
     )
 
     local gkRefresherCount = #refreshers
-    local shootingSection = frame(strikerContent, "Shooting", 0, 0, 292, 179)
+    local shootingSection = frame(strikerContent, "Shooting", 0, 0, 292, 249)
     shootingSection.BackgroundTransparency = 1
     text(shootingSection, "SHOOTING", 9, {
         Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(292, 16),
         Font = Enum.Font.FredokaOne, TextColor3 = C.muted,
     })
-    activeBody = frame(shootingSection, "Options", 0, 22, 292, 157)
+    activeBody = frame(shootingSection, "Options", 0, 22, 292, 227)
     activeBody.BackgroundTransparency = 1
     create("UIListLayout", {
         Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder,
     }, activeBody)
     order = 0
     toggle("Best shot assist", function() return STR.Enabled end, STR.SetEnabled, "BestShot")
+    toggle("v1 fake", function() return STR.FakeShotV1 end, STR.SetFakeShotV1)
+    toggle("v2 fake", function() return STR.FakeShotV2 end, STR.SetFakeShotV2)
     toggle("Auto curve ball", function() return STR.AutoCurve end, STR.SetAutoCurve)
     toggle("Smart shot release", function() return STR.SmartRelease end, STR.SetSmartRelease)
-    toggle("Fake shot v1 (dribble)", function() return STR.FakeV1Active end, STR.SetFakeV1, "BestShotFakeV1")
-    toggle("Fake shot v2 (75° flick)", function() return STR.FakeV2Active end, STR.SetFakeV2, "BestShotFakeV2")
     do
         order += 1
         local row = frame(activeBody, "ShotRange", 0, 0, 292, 49, C.control)
@@ -9391,13 +9513,13 @@ local function buildDmcInterface() -- own function: Luau allows max 200 active l
         drawRange()
         table.insert(refreshers, drawRange)
     end
-    local miscellaneousSection = frame(strikerContent, "Miscellaneous", 0, 193, 292, 124)
+    local miscellaneousSection = frame(strikerContent, "Miscellaneous", 0, 258, 292, 60)
     miscellaneousSection.BackgroundTransparency = 1
     text(miscellaneousSection, "MISCELLANEOUS", 9, {
         Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(292, 16),
         Font = Enum.Font.FredokaOne, TextColor3 = C.muted,
     })
-    activeBody = frame(miscellaneousSection, "Options", 0, 22, 292, 102)
+    activeBody = frame(miscellaneousSection, "Options", 0, 22, 292, 36)
     activeBody.BackgroundTransparency = 1
     create("UIListLayout", {
         Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder,
@@ -10279,6 +10401,57 @@ end
 buildDmcInterface()
 
 SettingsStore.Acknowledge()
+
+ENV.RunBanyuSelfTest = function()
+    local passed, failed, results = 0, 0, {}
+    local function check(name, fn)
+        local ok, err = pcall(fn)
+        if ok then
+            passed += 1
+            results[#results + 1] = "[PASS] " .. name
+        else
+            failed += 1
+            results[#results + 1] = "[FAIL] " .. name .. " -> " .. tostring(err)
+        end
+    end
+
+    check("Legacy profile validation", function()
+        local profile = {
+            goalkeeper = { Enabled = true, CloseRangeRush = true, HighBallJumps = true,
+                JumpThenDive = true, BackwardRecovery = false, PositionAssist = true,
+                PreShotCoverage = true, RespectManualMovement = true, DiveFilter = "SIDES",
+                PositionMode = "THREATS" },
+            striker = { Enabled = true, AutoCurve = false, SmartRelease = false, Range = 55 },
+            misc = { AutoDribble = true, InfiniteStamina = true },
+            accent = "DEC173", rainbowUI = false,
+        }
+        local valid = SettingsStore.Validate(profile)
+        assert(type(valid) == "table" and valid.misc.InfiniteStamina == nil)
+    end)
+    check("InfiniteStamina compatibility stub", function()
+        assert(MISC.SetInfiniteStamina(true) == true)
+        assert(MISC.InfiniteStamina == false and MISC.StaminaStatus == "REMOVED")
+    end)
+    check("Fake shot exclusivity", function()
+        local enabled = STR.Enabled
+        local v1, v2 = STR.FakeShotV1, STR.FakeShotV2
+        assert(STR.SetFakeShotV1(true) == true and STR.FakeShotV1 and not STR.FakeShotV2)
+        assert(STR.SetFakeShotV2(true) == true and STR.FakeShotV2 and not STR.FakeShotV1)
+        STR.SetFakeShotV1(v1)
+        STR.SetFakeShotV2(v2)
+        STR.SetEnabled(enabled)
+    end)
+    check("Natural post margin", function()
+        assert(type(Config.NaturalPostMarginStuds) == "number")
+        assert(type(getExtendedGoalCrossing) == "function")
+    end)
+
+    for _, line in ipairs(results) do print("[Banyu Self-Test] " .. line) end
+    print(string.format("[Banyu Self-Test] Passed: %d | Failed: %d", passed, failed))
+    return { passed = passed, failed = failed, results = results }
+end
+
+if Config.Debug then task.defer(ENV.RunBanyuSelfTest) end
 
 print("[Auto GK] Loaded | RightShift: show / hide | UI starts hidden")
 
