@@ -6736,9 +6736,12 @@ local function createStriker(d)
         if A.FakeShotV2 and not f.volley and (flickAlpha > 0 or owner.releasing) then
             owner.fakeV2Used = true
             local alpha = owner.releasing and 1 or flickAlpha
-            local yaw = angles(chosen.Direction)
-            local _, basePitch = angles(owner.initialDirection or sample.Direction)
-            chosen = aimAt(f, yaw, basePitch + (C.FakeV2PitchRadians - basePitch) * alpha)
+            -- Use the INITIAL camera yaw (not the side-flicked chosen),
+            -- so 75° pitch goes above the player's original camera, not above
+            -- the flick direction. Best Shot side-flick is intentionally ignored.
+            local baseDir = owner.initialDirection or sample.Direction
+            local baseYaw, basePitch = angles(baseDir)
+            chosen = aimAt(f, baseYaw, basePitch + (C.FakeV2PitchRadians - basePitch) * alpha)
             owner.flicked = alpha >= 0.999
             owner.redirected = true
             owner.reason = "v2_fake_75deg"
@@ -6747,8 +6750,16 @@ local function createStriker(d)
         if A.FakeShotV1 and not f.volley then
             owner.fakeV1Used = true
             if math.clamp((f.elapsed or 0) / math.max(f.maximumCharge or 0, 1e-4), 0, 1) >= C.FakeV1DribbleCharge then
+                -- Apply the Best Shot Assist flick direction BEFORE triggering
+                -- dribble, so the flick aim is visible. Then dribble cancels charge.
+                owner.applied, owner.rating, owner.direction = true, best, chosen.Direction
+                owner.appliedAim = table.clone(chosen)
+                owner.redirected = true
+                owner.reason = "v1_fake_dribble"
+                local scope = scopes[thread()]
+                if scope then scope.applied = true end
                 executeFakeV1Dribble(owner)
-                return sample
+                return chosen
             end
         end
         owner.applied, owner.rating, owner.direction = true, best, chosen.Direction
