@@ -6314,13 +6314,6 @@ local function createStriker(d)
         A.FakeShotV1 = false -- one use per toggle
         task.defer(function()
             if not alive or not d.alive() then return end
-            -- Native Dodge refuses while a charge is live; cancel and refresh first.
-            if N.Client and type(N.Client.IsCharging) == "function" and N.Client.IsCharging() then
-                pcall(N.Client.CancelCharge)
-            end
-            if d.M.Dodge and type(d.M.Dodge.UpdateControlState) == "function" then
-                pcall(d.M.Dodge.UpdateControlState)
-            end
             if N.Controls and type(N.Controls.CreateInput) == "function"
                 and d.M.Dodge and type(d.M.Dodge.HandleInputBegan) == "function" then
                 local input = N.Controls.CreateInput("Dribble")
@@ -6355,6 +6348,7 @@ local function createStriker(d)
             return sample
         end
         owner.sample = table.clone(sample)
+        owner.initialDirection = owner.initialDirection or sample.Direction
         owner.frame = f
         if #f.keepers == 0 then
             owner.applied, owner.rating, owner.job, owner.reason = false, nil, nil, "no_keeper"
@@ -6365,46 +6359,15 @@ local function createStriker(d)
         end
         local normal = rate(f, sample, false)
         owner.rawRating = normal
-        local flickAlpha = flickBlendAlpha(f)
-
-        -- V2 fake: any hold length -> 75° upward flick on release -> auto OFF.
-        if A.FakeShotV2 and not f.volley then
-            owner.fakeV2Used = true
-            if flickAlpha > 0 or owner.releasing then
-                local alpha = owner.releasing and 1 or flickAlpha
-                local yaw, basePitch = angles(sample.Direction)
-                local upwardAim = aimAt(f, yaw, basePitch + (C.FakeV2PitchRadians - basePitch) * alpha)
-                owner.applied = true
-                owner.rating = normal
-                owner.direction = upwardAim.Direction
-                owner.appliedAim = table.clone(upwardAim)
-                owner.flicked = alpha >= 0.999
-                owner.redirected = true
-                owner.reason = "v2_fake_75deg"
-                setStatus("V2 FAKE (75° UP)", "Flick 75° up | OFF on release")
-                local scope = scopes[thread()]
-                if scope then scope.applied = true end
-                return upwardAim
-            end
-            setStatus("V2 FAKE READY", "Hold shoot, release anytime for 75° flick")
-            return sample
-        end
-
-        -- V1 fake: side flick from 72%, cancel + dribble at 88% -> auto OFF.
-        if A.FakeShotV1 and not f.volley then
-            owner.fakeV1Used = true
-            if math.clamp((f.elapsed or 0) / math.max(f.maximumCharge or 0, 1e-4), 0, 1) >= C.FakeV1DribbleCharge then
-                executeFakeV1Dribble(owner)
-                return sample
-            end
-        end
+        local flickAlpha = A.FakeShotV2 and owner.releasing and not f.volley and 1 or flickBlendAlpha(f)
 
         local flickSide = flickAlpha > 0
             and (previousFlickSide ~= 0 and previousFlickSide or flickTargetSide(f, sample))
             or 0
         owner.flickSide = flickSide
         owner.flickAlpha = flickAlpha
-        owner.flickActive = (A.FlickAssist or A.FakeShotV1) and flickSide ~= 0 and flickAlpha > 0
+        owner.flickActive = (A.FlickAssist or A.FakeShotV1 or A.FakeShotV2)
+            and flickSide ~= 0 and flickAlpha > 0
         local bestShotSide = preferredShotSide(f)
         owner.bestShotSide = bestShotSide
         -- Prepare far-side candidates before the actual redirect window.
@@ -6770,17 +6733,36 @@ local function createStriker(d)
                 chosen = blended
             end
         end
+        if A.FakeShotV2 and not f.volley and (flickAlpha > 0 or owner.releasing) then
+            owner.fakeV2Used = true
+            local alpha = owner.releasing and 1 or flickAlpha
+            local yaw = angles(chosen.Direction)
+            local _, basePitch = angles(owner.initialDirection or sample.Direction)
+            chosen = aimAt(f, yaw, basePitch + (C.FakeV2PitchRadians - basePitch) * alpha)
+            owner.flicked = alpha >= 0.999
+            owner.redirected = true
+            owner.reason = "v2_fake_75deg"
+            setStatus("V2 FAKE (75° UP)", "Best Shot flick + 75° camera overlay | OFF")
+        end
+        if A.FakeShotV1 and not f.volley then
+            owner.fakeV1Used = true
+            if math.clamp((f.elapsed or 0) / math.max(f.maximumCharge or 0, 1e-4), 0, 1) >= C.FakeV1DribbleCharge then
+                executeFakeV1Dribble(owner)
+                return sample
+            end
+        end
         owner.applied, owner.rating, owner.direction = true, best, chosen.Direction
         owner.appliedAim = table.clone(chosen)
-        owner.flicked = owner.flickActive and not owner.flickFallback
+        owner.flicked = owner.fakeV2Used or (owner.flickActive and not owner.flickFallback
             and (owner.flickAlpha or 0) >= 0.999
-            and candidateSide(f, selectedCandidate) == flickSide
+            and candidateSide(f, selectedCandidate) == flickSide)
         owner.redirected = (chosen.Direction - sample.Direction).Magnitude > 1e-5 or math.abs(selectedCurve - f.curve) > 1e-5
-        owner.reason = owner.flicked and "flick_assist" or (owner.redirected and "assisted" or "confirmed_aim")
+        owner.reason = owner.fakeV2Used and "v2_fake_75deg"
+            or (owner.flicked and "flick_assist" or (owner.redirected and "assisted" or "confirmed_aim"))
         stats.lastCharge, stats.lastCurve = f.charge, selectedCurve
-        setStatus(owner.flicked and "FLICK ASSIST" or (best.defenderRisk == 2 and "DEFENDER IN SHOT PATH"
+        setStatus(owner.fakeV2Used and "V2 FAKE (75° UP)" or (owner.flicked and "FLICK ASSIST" or (best.defenderRisk == 2 and "DEFENDER IN SHOT PATH"
             or (best.defenderRisk == 1 and "DEFENDERS COVER SHOT")
-            or (not owner.redirected and "AIM CONFIRMED" or (best.gap >= C.ClearGapThreshold and "OUTSIDE MODELED REACH" or "BEST AVAILABLE SHOT"))),
+            or (not owner.redirected and "AIM CONFIRMED" or (best.gap >= C.ClearGapThreshold and "OUTSIDE MODELED REACH" or "BEST AVAILABLE SHOT")))),
             decisionDetail(owner))
         local scope = scopes[thread()]
         if scope then scope.applied = true end
